@@ -20,11 +20,11 @@ jobs:
           submodules: 'recursive'
           path: 'chiaki-ng'
 
-      - name: Apply stability fixes
+      - name: Apply stability fixes phase 2
         working-directory: chiaki-ng
         run: |
-          git apply --check estabilidad-fase1.patch
-          git apply estabilidad-fase1.patch
+          git apply --check estabilidad-fase2.patch
+          git apply estabilidad-fase2.patch
 
       - name: Add QmlWebEngine Import
         working-directory: chiaki-ng
