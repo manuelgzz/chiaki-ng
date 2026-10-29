@@ -1,0 +1,856 @@
+diff --git a/docs/stream-stability-phase1.md b/docs/stream-stability-phase1.md
+new file mode 100644
+index 0000000..a15adad
+--- /dev/null
++++ b/docs/stream-stability-phase1.md
+@@ -0,0 +1,79 @@
++# Stream stability: first implementation batch
++
++Base: c8bea2642d0e95402f373af55584a3b98cd89417 (main, 2026-10-09).
++
++This batch implements priorities 1–3 of the stability review. It changes the
++shared C core and the Qt frontend's IDR request integration. It does not change
++bitrate, rendering backend, codec, socket buffer sizes or the default (disabled)
++setting for automatic IDR requests after an FEC failure.
++
++## 1. Packet statistics
++
++- Establish the sequential baseline from the first observed packet.
++- Use 16-bit modular arithmetic across sequence wrap.
++- Track unique sequence numbers with an 8 KiB bitmap per statistics instance.
++- Ignore packets belonging to an already finalized reporting interval.
++- Protect updates, snapshots and resets with the same mutex.
++- Clamp sequential losses to zero if the received count exceeds the span.
++
++Reordered packets received before an interval closes repair gaps in that
++interval. A late packet cannot retroactively modify a report already sent to
++the console. As in the sequence-number helpers, ordering assumes advances of
++less than half the 16-bit sequence space within a reporting interval; this is
++appropriate for the audio sequence stream and the 200 ms reporting period.
++
++## 2. Video frame accounting
++
++Count missing frames relative to the last processed frame, rather than repeatedly
++counting from the last successfully decoded frame. Count failed frames,
++completely missing frames and frames intentionally skipped during IDR recovery
++once, including across 65535 → 0. Count a rejected callback as a dropped frame.
++Saturate cumulative counters instead of allowing signed integer overflow.
++Initialize slice metadata before parsing it.
++
++## 3. Bounded IDR recovery
++
++Use a shared recovery state for automatic and manual IDR requests. Coalesce
++requests while recovery is active, including after an initial send failure.
++Retry at one-second intervals, with at most three submission attempts in a
++recovery episode. The existing one-second heartbeat polls recovery even without
++new video packets. Scheduling can delay a poll, so the timeout is acted upon at
++the first heartbeat at/after three seconds; it is not a hard real-time deadline.
++
++On timeout, stop suppressing frames and resume the existing reference-frame
++recovery path. This bounds the IDR gate; it does not guarantee that corrupted
++video can be decoded. No automatic reconnect, GPU reset or decoder recreation
++is introduced. An arriving recognized I-frame ends the wait and clears the
++receiver's stale reference history. Unparseable slices cannot bypass the gate.
++The I-frame recognition follows the existing parser; this batch does not expand
++its supported H.264/H.265 NAL types.
++
++## Validation
++
++- Core library compiled on Linux x86_64 with FFmpeg enabled (FFmpeg 6.1.1),
++  Qt GUI and CLI disabled.
++- General unit suite: 124/124 passed, including three new packet-statistics tests.
++- Isolated receiver suite: 5/5 passed with real frame processing, FEC and
++  bitstream parsing, plus a deterministic clock and fake transport.
++- Eight focused tests passed with AddressSanitizer and UndefinedBehaviorSanitizer.
++  LeakSanitizer was disabled because process inspection is restricted here.
++- No PS5, live network stream, GPU rendering, Gaming Mode, GUI compilation or
++  end-to-end latency measurement was available for this batch.
++
++The isolated receiver suite covers repeated FEC failures, missing frames,
++sequence wrap, callback rejection, counter saturation, automatic-recovery
++opt-in, send failure, request coalescing, retry spacing, timeout, malformed
++slices and recovery on H.264/H.265 I-frame fixtures.
++
++## Remaining priorities
++
++4. Separate network reception from decoder submission with explicit memory
++   ownership, bounded work and dependency-aware overflow recovery.
++5. Stabilize the video clock and coalesce Qt delivery/presentation notifications;
++   verify session lifetime and hardware-frame ownership across shutdown.
++6. Tune video reordering/audio buffering using measured jitter and frame age.
++
++These architectural changes are not implemented in this first batch. In
++particular, buffer sizes and cadence heuristics should not be tuned from unit
++tests alone. Establish the corrected baseline first and compare recordings of
++queue age, socket drops, decode time and presentation time during PS5 sessions.
+diff --git a/gui/src/streamsession.cpp b/gui/src/streamsession.cpp
+index d9d0d45..7e99c33 100755
+--- a/gui/src/streamsession.cpp
++++ b/gui/src/streamsession.cpp
+@@ -2404,8 +2404,7 @@ void StreamSession::Event(ChiakiEvent *event)
+ 			}
+ 			else
+ 			{
+-				CHIAKI_LOGW(log.GetChiakiLog(), "Video FEC failure, retrying IDR request after send failure");
+-				RequestIDR();
++				CHIAKI_LOGW(log.GetChiakiLog(), "Video FEC failure, IDR retry scheduled by video receiver");
+ 			}
+ 			emit FecFailure();
+ 			break;
+@@ -2764,8 +2763,6 @@ bool StreamSession::RequestIDR()
+ 	ChiakiErrorCode err = chiaki_session_request_idr(&session);
+ 	if(err == CHIAKI_ERR_SUCCESS)
+ 	{
+-		if(session.stream_connection.video_receiver)
+-			chiaki_video_receiver_set_waiting_for_idr(session.stream_connection.video_receiver, true);
+ 		return true;
+ 	}
+ 	CHIAKI_LOGW(log.GetChiakiLog(), "StreamSession failed to request IDR frame: %s", chiaki_error_string(err));
+diff --git a/lib/include/chiaki/packetstats.h b/lib/include/chiaki/packetstats.h
+index 104c8a9..a657c83 100644
+--- a/lib/include/chiaki/packetstats.h
++++ b/lib/include/chiaki/packetstats.h
+@@ -22,6 +22,10 @@ typedef struct chiaki_packet_stats_t
+ 	ChiakiSeqNum16 seq_min; // sequence number that was max at the last reset
+ 	ChiakiSeqNum16 seq_max; // currently maximal sequence number
+ 	uint64_t seq_received; // total received packets since the last reset
++	bool seq_initialized;
++	// One bit per 16-bit sequence number, cleared at each reporting boundary.
++	// Packets at/before seq_min belong to a previous reporting interval.
++	uint8_t seq_seen[8192];
+ } ChiakiPacketStats;
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_packet_stats_init(ChiakiPacketStats *stats);
+diff --git a/lib/include/chiaki/videoreceiver.h b/lib/include/chiaki/videoreceiver.h
+index a340b5d..094c93d 100644
+--- a/lib/include/chiaki/videoreceiver.h
++++ b/lib/include/chiaki/videoreceiver.h
+@@ -37,6 +37,9 @@ typedef struct chiaki_video_receiver_t
+ 	ChiakiBitstream bitstream;
+ 	ChiakiMutex waiting_for_idr_mutex;
+ 	bool waiting_for_idr;
++	uint64_t idr_wait_start_us;
++	uint64_t idr_last_request_us;
++	unsigned int idr_request_attempts;
+ 	ChiakiMutex frames_lost_mutex;
+ } ChiakiVideoReceiver;
+ 
+@@ -55,6 +58,10 @@ CHIAKI_EXPORT void chiaki_video_receiver_stream_info(ChiakiVideoReceiver *video_
+ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_receiver, ChiakiTakionAVPacket *packet);
+ CHIAKI_EXPORT void chiaki_video_receiver_set_waiting_for_idr(ChiakiVideoReceiver *video_receiver, bool waiting_for_idr);
+ CHIAKI_EXPORT bool chiaki_video_receiver_get_waiting_for_idr(ChiakiVideoReceiver *video_receiver);
++// Start bounded IDR recovery, or coalesce with a recovery already in progress.
++CHIAKI_EXPORT ChiakiErrorCode chiaki_video_receiver_request_idr(ChiakiVideoReceiver *video_receiver);
++// Called by the stream heartbeat even when no video packets arrive.
++CHIAKI_EXPORT void chiaki_video_receiver_poll_recovery(ChiakiVideoReceiver *video_receiver);
+ CHIAKI_EXPORT int32_t chiaki_video_receiver_get_frames_lost_total(ChiakiVideoReceiver *video_receiver);
+ 
+ static inline ChiakiVideoReceiver *chiaki_video_receiver_new(struct chiaki_session_t *session, ChiakiPacketStats *packet_stats)
+diff --git a/lib/src/packetstats.c b/lib/src/packetstats.c
+index 58ef4c6..ddf645a 100644
+--- a/lib/src/packetstats.c
++++ b/lib/src/packetstats.c
+@@ -3,6 +3,7 @@
+ #include <chiaki/packetstats.h>
+ #include <chiaki/log.h>
+ #include <assert.h>
++#include <string.h>
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_packet_stats_init(ChiakiPacketStats *stats)
+ {
+@@ -16,6 +17,8 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_packet_stats_init(ChiakiPacketStats *stats)
+ 	stats->seq_min = 0;
+ 	stats->seq_max = 0;
+ 	stats->seq_received = 0;
++	stats->seq_initialized = false;
++	memset(stats->seq_seen, 0, sizeof(stats->seq_seen));
+ 	err = chiaki_mutex_unlock(&stats->mutex);
+ 	return err;
+ }
+@@ -31,6 +34,7 @@ static void reset_stats(ChiakiPacketStats *stats)
+ 	stats->gen_lost = 0;
+ 	stats->seq_min = stats->seq_max;
+ 	stats->seq_received = 0;
++	memset(stats->seq_seen, 0, sizeof(stats->seq_seen));
+ }
+ 
+ CHIAKI_EXPORT void chiaki_packet_stats_reset(ChiakiPacketStats *stats)
+@@ -50,9 +54,25 @@ CHIAKI_EXPORT void chiaki_packet_stats_push_generation(ChiakiPacketStats *stats,
+ 
+ CHIAKI_EXPORT void chiaki_packet_stats_push_seq(ChiakiPacketStats *stats, ChiakiSeqNum16 seq_num)
+ {
++	chiaki_mutex_lock(&stats->mutex);
++	if(!stats->seq_initialized)
++	{
++		// The first observed packet establishes the baseline; its starting
++		// sequence number is not evidence of missing packets.
++		stats->seq_min = stats->seq_max = (ChiakiSeqNum16)(seq_num - 1);
++		stats->seq_initialized = true;
++	}
++	if(!chiaki_seq_num_16_gt(seq_num, stats->seq_min))
++		goto done;
++	uint8_t mask = (uint8_t)(1u << (seq_num & 7));
++	if(stats->seq_seen[seq_num >> 3] & mask)
++		goto done;
++	stats->seq_seen[seq_num >> 3] |= mask;
+ 	stats->seq_received++;
+ 	if(chiaki_seq_num_16_gt(seq_num, stats->seq_max))
+ 		stats->seq_max = seq_num;
++done:
++	chiaki_mutex_unlock(&stats->mutex);
+ }
+ 
+ CHIAKI_EXPORT void chiaki_packet_stats_get(ChiakiPacketStats *stats, bool reset, uint64_t *received, uint64_t *lost)
+@@ -68,8 +88,8 @@ CHIAKI_EXPORT void chiaki_packet_stats_get(ChiakiPacketStats *stats, bool reset,
+ 	//		(unsigned long long)stats->gen_lost);
+ 
+ 	// seq
+-	uint64_t seq_diff = stats->seq_max - stats->seq_min; // overflow on purpose if max < min
+-	uint64_t seq_lost = stats->seq_received > seq_diff ? seq_diff : seq_diff - stats->seq_received;
++	uint64_t seq_diff = (ChiakiSeqNum16)(stats->seq_max - stats->seq_min);
++	uint64_t seq_lost = stats->seq_received >= seq_diff ? 0 : seq_diff - stats->seq_received;
+ 	*received += stats->seq_received;
+ 	*lost += seq_lost;
+ 
+diff --git a/lib/src/session.c b/lib/src/session.c
+index 41c6bbf..bfcfd13 100644
+--- a/lib/src/session.c
++++ b/lib/src/session.c
+@@ -333,7 +333,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_join(ChiakiSession *session)
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_request_idr(ChiakiSession *session)
+ {
+-	return stream_connection_send_idr_request(&session->stream_connection);
++	if(!session->stream_connection.video_receiver)
++		return CHIAKI_ERR_UNINITIALIZED;
++	return chiaki_video_receiver_request_idr(session->stream_connection.video_receiver);
+ }
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_set_controller_state(ChiakiSession *session, ChiakiControllerState *state)
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index afa1a60..3794b7d 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -317,6 +317,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
+ 		if(err != CHIAKI_ERR_TIMEOUT)
+ 			break;
+ 
++		chiaki_video_receiver_poll_recovery(stream_connection->video_receiver);
+ 		err = stream_connection_send_heartbeat(stream_connection);
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 			CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to send heartbeat");
+diff --git a/lib/src/videoreceiver.c b/lib/src/videoreceiver.c
+index ed3cc76..9322bea 100644
+--- a/lib/src/videoreceiver.c
++++ b/lib/src/videoreceiver.c
+@@ -4,9 +4,27 @@
+ #include "../include/chiaki/session.h"
+ 
+ #include <string.h>
++#include <limits.h>
++#include <chiaki/time.h>
++
++#define IDR_RETRY_INTERVAL_US UINT64_C(1000000)
++#define IDR_RECOVERY_TIMEOUT_US UINT64_C(3000000)
++#define IDR_MAX_REQUEST_ATTEMPTS 3
+ 
+ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver);
+ 
++// Count each dropped frame once. The caller advances frame_index_prev after
++// finishing a frame; completely absent frames are counted at the next arrival.
++static void count_lost_frames(ChiakiVideoReceiver *video_receiver, uint16_t count)
++{
++	chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
++	video_receiver->frames_lost += count > INT32_MAX - video_receiver->frames_lost
++		? INT32_MAX - video_receiver->frames_lost : count;
++	video_receiver->frames_lost_total += count > INT32_MAX - video_receiver->frames_lost_total
++		? INT32_MAX - video_receiver->frames_lost_total : count;
++	chiaki_mutex_unlock(&video_receiver->frames_lost_mutex);
++}
++
+ static void add_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
+ {
+ 	if(video_receiver->reference_frames[0] != -1)
+@@ -54,6 +72,9 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
+ 	chiaki_bitstream_init(&video_receiver->bitstream, video_receiver->log, video_receiver->session->connect_info.video_profile.codec);
+ 	chiaki_mutex_init(&video_receiver->waiting_for_idr_mutex, false);
+ 	video_receiver->waiting_for_idr = false;
++	video_receiver->idr_wait_start_us = 0;
++	video_receiver->idr_last_request_us = 0;
++	video_receiver->idr_request_attempts = 0;
+ 	chiaki_mutex_init(&video_receiver->frames_lost_mutex, false);
+ }
+ 
+@@ -69,6 +90,12 @@ CHIAKI_EXPORT void chiaki_video_receiver_fini(ChiakiVideoReceiver *video_receive
+ CHIAKI_EXPORT void chiaki_video_receiver_set_waiting_for_idr(ChiakiVideoReceiver *video_receiver, bool waiting_for_idr)
+ {
+ 	chiaki_mutex_lock(&video_receiver->waiting_for_idr_mutex);
++	if(waiting_for_idr && !video_receiver->waiting_for_idr)
++	{
++		video_receiver->idr_wait_start_us = chiaki_time_now_monotonic_us();
++		video_receiver->idr_last_request_us = video_receiver->idr_wait_start_us;
++		video_receiver->idr_request_attempts = 1;
++	}
+ 	video_receiver->waiting_for_idr = waiting_for_idr;
+ 	chiaki_mutex_unlock(&video_receiver->waiting_for_idr_mutex);
+ }
+@@ -82,6 +109,48 @@ CHIAKI_EXPORT bool chiaki_video_receiver_get_waiting_for_idr(ChiakiVideoReceiver
+ 	return waiting_for_idr;
+ }
+ 
++CHIAKI_EXPORT ChiakiErrorCode chiaki_video_receiver_request_idr(ChiakiVideoReceiver *video_receiver)
++{
++	chiaki_mutex_lock(&video_receiver->waiting_for_idr_mutex);
++	ChiakiErrorCode err = CHIAKI_ERR_SUCCESS;
++	if(!video_receiver->waiting_for_idr)
++	{
++		video_receiver->waiting_for_idr = true;
++		video_receiver->idr_wait_start_us = chiaki_time_now_monotonic_us();
++		video_receiver->idr_last_request_us = video_receiver->idr_wait_start_us;
++		video_receiver->idr_request_attempts = 1;
++		// Hold the recovery lock through submission so a fast IDR cannot be
++		// consumed before the waiting state is established.
++		err = stream_connection_send_idr_request(&video_receiver->session->stream_connection);
++	}
++	chiaki_mutex_unlock(&video_receiver->waiting_for_idr_mutex);
++	return err;
++}
++
++CHIAKI_EXPORT void chiaki_video_receiver_poll_recovery(ChiakiVideoReceiver *video_receiver)
++{
++	chiaki_mutex_lock(&video_receiver->waiting_for_idr_mutex);
++	if(video_receiver->waiting_for_idr)
++	{
++		uint64_t now = chiaki_time_now_monotonic_us();
++		if(now - video_receiver->idr_wait_start_us >= IDR_RECOVERY_TIMEOUT_US)
++		{
++			video_receiver->waiting_for_idr = false;
++			CHIAKI_LOGW(video_receiver->log, "IDR recovery timed out; resuming reference-frame recovery");
++		}
++		else if(video_receiver->idr_request_attempts < IDR_MAX_REQUEST_ATTEMPTS
++			&& now - video_receiver->idr_last_request_us >= IDR_RETRY_INTERVAL_US)
++		{
++			video_receiver->idr_last_request_us = now;
++			video_receiver->idr_request_attempts++;
++			ChiakiErrorCode err = stream_connection_send_idr_request(&video_receiver->session->stream_connection);
++			if(err != CHIAKI_ERR_SUCCESS)
++				CHIAKI_LOGW(video_receiver->log, "IDR retry failed: %s", chiaki_error_string(err));
++		}
++	}
++	chiaki_mutex_unlock(&video_receiver->waiting_for_idr_mutex);
++}
++
+ CHIAKI_EXPORT int32_t chiaki_video_receiver_get_frames_lost_total(ChiakiVideoReceiver *video_receiver)
+ {
+ 	int32_t total;
+@@ -157,6 +226,16 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 			CHIAKI_LOGW(video_receiver->log, "Video receiver could not flush frame.");
+ 
++		if(video_receiver->frame_index_cur < 0)
++		{
++			// Do not interpret an arbitrary initial index as startup loss.
++			video_receiver->frame_index_prev = (ChiakiSeqNum16)(frame_index - 1);
++			video_receiver->frame_index_prev_complete = video_receiver->frame_index_prev;
++		}
++		ChiakiSeqNum16 first_unprocessed = (ChiakiSeqNum16)(video_receiver->frame_index_prev + 1);
++		if(chiaki_seq_num_16_gt(frame_index, first_unprocessed))
++			count_lost_frames(video_receiver, (ChiakiSeqNum16)(frame_index - first_unprocessed));
++
+ 		ChiakiSeqNum16 next_frame_expected = (ChiakiSeqNum16)(video_receiver->frame_index_prev_complete + 1);
+ 		if(chiaki_seq_num_16_gt(frame_index, next_frame_expected)
+ 			&& !(frame_index == 1 && video_receiver->frame_index_cur < 0)) // ok for frame 1
+@@ -197,45 +276,23 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 	if(flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FAILED
+ 		|| flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)
+ 	{
+-		if (flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)
++		if(flush_result == CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED)
+ 		{
+ 			ChiakiSeqNum16 next_frame_expected = (ChiakiSeqNum16)(video_receiver->frame_index_prev_complete + 1);
+ 			stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, video_receiver->frame_index_cur);
+ 			if(video_receiver->session->connect_info.enable_idr_on_fec_failure)
+ 			{
+-				bool waiting_for_idr = chiaki_video_receiver_get_waiting_for_idr(video_receiver);
+-				bool idr_request_sent = waiting_for_idr;
+-				if(!waiting_for_idr)
+-				{
+-					ChiakiErrorCode err = stream_connection_send_idr_request(&video_receiver->session->stream_connection);
+-					idr_request_sent = err == CHIAKI_ERR_SUCCESS;
+-					if(err == CHIAKI_ERR_SUCCESS)
+-					{
+-						chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
+-						CHIAKI_LOGI(video_receiver->log, "FEC failed, waiting for IDR frame");
+-					}
+-					else
+-					{
+-						CHIAKI_LOGW(video_receiver->log, "FEC failed and IDR request could not be sent: %s", chiaki_error_string(err));
+-					}
+-				}
+-				else
+-				{
+-					CHIAKI_LOGW(video_receiver->log, "Video FEC failure, already waiting for requested IDR");
+-				}
++				ChiakiErrorCode request_err = chiaki_video_receiver_request_idr(video_receiver);
++				bool idr_request_sent = request_err == CHIAKI_ERR_SUCCESS;
+ 				ChiakiEvent event = { 0 };
+ 				event.type = CHIAKI_EVENT_VIDEO_FEC_FAILURE;
+ 				event.video_fec_failure.frame_index = video_receiver->frame_index_cur;
+ 				event.video_fec_failure.idr_request_sent = idr_request_sent;
+ 				chiaki_session_send_event(video_receiver->session, &event);
+ 			}
+-		int32_t lost = video_receiver->frame_index_cur - next_frame_expected + 1;
+-		chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
+-		video_receiver->frames_lost += lost;
+-		video_receiver->frames_lost_total += lost;
+-		chiaki_mutex_unlock(&video_receiver->frames_lost_mutex);
++		}
++		count_lost_frames(video_receiver, 1);
+ 		video_receiver->frame_index_prev = video_receiver->frame_index_cur;
+-	}
+ 		CHIAKI_LOGW(video_receiver->log, "Failed to complete frame %d", (int)video_receiver->frame_index_cur);
+ 		return CHIAKI_ERR_UNKNOWN;
+ 	}
+@@ -243,24 +300,27 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 	bool succ = flush_result != CHIAKI_FRAME_PROCESSOR_FLUSH_RESULT_FEC_FAILED;
+ 	bool recovered = false;
+ 
+-	ChiakiBitstreamSlice slice;
+-	if(chiaki_bitstream_slice(&video_receiver->bitstream, frame, frame_size, &slice))
++	ChiakiBitstreamSlice slice = { 0 };
++	bool parsed_slice = chiaki_bitstream_slice(&video_receiver->bitstream, frame, frame_size, &slice);
++	if(chiaki_video_receiver_get_waiting_for_idr(video_receiver))
+ 	{
+-		if(chiaki_video_receiver_get_waiting_for_idr(video_receiver))
++		if(parsed_slice && slice.slice_type == CHIAKI_BITSTREAM_SLICE_I)
+ 		{
+-			if(slice.slice_type == CHIAKI_BITSTREAM_SLICE_I)
+-			{
+-				chiaki_video_receiver_set_waiting_for_idr(video_receiver, false);
+-				CHIAKI_LOGI(video_receiver->log, "Received IDR frame, resuming decode");
+-			}
+-			else
+-			{
+-				CHIAKI_LOGV(video_receiver->log, "Skipping P-frame %d while waiting for IDR", (int)video_receiver->frame_index_cur);
+-				video_receiver->frame_index_prev = video_receiver->frame_index_cur;
+-				return CHIAKI_ERR_SUCCESS;
+-			}
++			chiaki_video_receiver_set_waiting_for_idr(video_receiver, false);
++			memset(video_receiver->reference_frames, -1, sizeof(video_receiver->reference_frames));
++			CHIAKI_LOGI(video_receiver->log, "Received IDR frame, resuming decode");
++		}
++		else
++		{
++			CHIAKI_LOGV(video_receiver->log, "Skipping P-frame %d while waiting for IDR", (int)video_receiver->frame_index_cur);
++			count_lost_frames(video_receiver, 1);
++			video_receiver->frame_index_prev = video_receiver->frame_index_cur;
++			return CHIAKI_ERR_SUCCESS;
+ 		}
++	}
+ 
++	if(parsed_slice)
++	{
+ 		if(slice.slice_type == CHIAKI_BITSTREAM_SLICE_P)
+ 		{
+ 			ChiakiSeqNum16 ref_frame_index = video_receiver->frame_index_cur - slice.reference_frame - 1;
+@@ -282,10 +342,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 				if(!recovered)
+ 				{
+ 					succ = false;
+-					chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
+-					video_receiver->frames_lost++;
+-					video_receiver->frames_lost_total++;
+-					chiaki_mutex_unlock(&video_receiver->frames_lost_mutex);
++					count_lost_frames(video_receiver, 1);
+ 					CHIAKI_LOGW(video_receiver->log, "Missing reference frame %d for decoding frame %d", (int)ref_frame_index, (int)video_receiver->frame_index_cur);
+ 				}
+ 			}
+@@ -301,6 +358,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 		if(!cb_succ)
+ 		{
+ 			succ = false;
++			count_lost_frames(video_receiver, 1);
+ 			CHIAKI_LOGW(video_receiver->log, "Video callback did not process frame successfully.");
+ 		}
+ 		else
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index f30d758..8f42e38 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -10,6 +10,7 @@ endif()
+ 
+ set(CHIAKI_UNIT_SOURCES
+ 				main.c
++				packetstats.c
+ 				http.c
+ 				rpcrypt.c
+ 				gkcrypt.c
+@@ -40,3 +41,16 @@ target_link_libraries(chiaki-unit chiaki-lib munit)
+ if(CHIAKI_ENABLE_FFMPEG_DECODER)
+ 	target_link_libraries(chiaki-unit FFMPEG::avcodec FFMPEG::avutil)
+ endif()
++
++find_package(Threads REQUIRED)
++
++# Keep transport and time deterministic without linking the real session/network.
++add_executable(chiaki-video-recovery-test
++	videoreceiver.c
++	../lib/src/videoreceiver.c ../lib/src/frameprocessor.c
++	../lib/src/bitstream.c ../lib/src/fec.c ../lib/src/packetstats.c
++	../lib/src/thread.c ../lib/src/log.c)
++target_include_directories(chiaki-video-recovery-test PRIVATE
++	../lib/include "${PROJECT_BINARY_DIR}/lib/include")
++target_link_libraries(chiaki-video-recovery-test munit Jerasure::Jerasure Threads::Threads)
++add_test(NAME video-recovery COMMAND chiaki-video-recovery-test)
+diff --git a/test/main.c b/test/main.c
+index 1f926d7..b6384c4 100644
+--- a/test/main.c
++++ b/test/main.c
+@@ -4,6 +4,7 @@
+ #include <chiaki/config.h>
+ 
+ extern MunitTest tests_seq_num[];
++extern MunitTest tests_packet_stats[];
+ extern MunitTest tests_key_state[];
+ extern MunitTest tests_feedback[];
+ extern MunitTest tests_reorder_queue[];
+@@ -22,6 +23,7 @@ extern MunitTest tests_ffmpegdecoder[];
+ #endif
+ 
+ static MunitSuite suites[] = {
++	{ "/packet_stats", tests_packet_stats, NULL, 1, MUNIT_SUITE_OPTION_NONE },
+ 	{
+ 		"/seq_num",
+ 		tests_seq_num,
+diff --git a/test/packetstats.c b/test/packetstats.c
+new file mode 100644
+index 0000000..71045cc
+--- /dev/null
++++ b/test/packetstats.c
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++#include <munit.h>
++#include <chiaki/packetstats.h>
++
++static void expect_stats(ChiakiPacketStats *stats, bool reset, uint64_t expected_received, uint64_t expected_lost)
++{
++	uint64_t received, lost;
++	chiaki_packet_stats_get(stats, reset, &received, &lost);
++	munit_assert_uint64(received, ==, expected_received);
++	munit_assert_uint64(lost, ==, expected_lost);
++}
++
++static MunitResult test_sequences(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	ChiakiPacketStats stats;
++	munit_assert_int(chiaki_packet_stats_init(&stats), ==, CHIAKI_ERR_SUCCESS);
++	// A high initial sequence number must not imply a startup loss burst.
++	chiaki_packet_stats_push_seq(&stats, 65534);
++	chiaki_packet_stats_push_seq(&stats, 65535);
++	chiaki_packet_stats_push_seq(&stats, 0);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	expect_stats(&stats, true, 4, 0);
++	// Old packets, including duplicates across a reporting boundary, are ignored.
++	chiaki_packet_stats_push_seq(&stats, 0);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	expect_stats(&stats, false, 0, 0);
++	chiaki_packet_stats_push_seq(&stats, 2);
++	chiaki_packet_stats_push_seq(&stats, 4);
++	chiaki_packet_stats_push_seq(&stats, 4);
++	expect_stats(&stats, false, 2, 1);
++	chiaki_packet_stats_push_seq(&stats, 3);
++	expect_stats(&stats, true, 3, 0);
++	chiaki_packet_stats_push_seq(&stats, 7);
++	expect_stats(&stats, true, 1, 2);
++	chiaki_packet_stats_push_seq(&stats, 6);
++	chiaki_packet_stats_push_generation(&stats, 100, 5);
++	expect_stats(&stats, true, 100, 5);
++	expect_stats(&stats, false, 0, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++static MunitResult test_wrap_loss(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	ChiakiPacketStats stats;
++	chiaki_packet_stats_init(&stats);
++	chiaki_packet_stats_push_seq(&stats, 65534);
++	expect_stats(&stats, true, 1, 0);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	expect_stats(&stats, false, 1, 2);
++	chiaki_packet_stats_push_seq(&stats, 0);
++	chiaki_packet_stats_push_seq(&stats, 65535);
++	chiaki_packet_stats_push_seq(&stats, 0);
++	expect_stats(&stats, true, 3, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++static void *push_sequences(void *user)
++{
++	ChiakiPacketStats *stats = user;
++	for(unsigned int i = 1; i <= 10000; i++)
++		chiaki_packet_stats_push_seq(stats, (ChiakiSeqNum16)i);
++	return NULL;
++}
++
++static MunitResult test_concurrent_reset(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	ChiakiPacketStats stats;
++	chiaki_packet_stats_init(&stats);
++	ChiakiThread producer;
++	munit_assert_int(chiaki_thread_create(&producer, push_sequences, &stats), ==, CHIAKI_ERR_SUCCESS);
++	uint64_t total_received = 0, total_lost = 0, received, lost;
++	for(unsigned int i = 0; i < 1000; i++)
++	{
++		chiaki_packet_stats_get(&stats, true, &received, &lost);
++		total_received += received;
++		total_lost += lost;
++	}
++	munit_assert_int(chiaki_thread_join(&producer, NULL), ==, CHIAKI_ERR_SUCCESS);
++	chiaki_packet_stats_get(&stats, true, &received, &lost);
++	munit_assert_uint64(total_received + received, ==, 10000);
++	munit_assert_uint64(total_lost + lost, ==, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++MunitTest tests_packet_stats[] = {
++	{ "/sequences", test_sequences, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/wrap_loss", test_wrap_loss, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/concurrent_reset", test_concurrent_reset, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ NULL, NULL, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL }
++};
+diff --git a/test/videoreceiver.c b/test/videoreceiver.c
+new file mode 100644
+index 0000000..574e269
+--- /dev/null
++++ b/test/videoreceiver.c
+@@ -0,0 +1,224 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++// Isolated receiver tests: real frame processing/FEC/bitstream, deterministic
++// clock and transport. No console or network access is needed.
++#include <munit.h>
++#include <chiaki/session.h>
++#include <chiaki/videoreceiver.h>
++#include <string.h>
++#include <limits.h>
++
++static uint64_t now_us;
++static unsigned requests;
++static bool fail_request, reject_sample;
++static int32_t delivered_lost;
++static unsigned delivered;
++static ChiakiLog quiet_log;
++
++uint64_t chiaki_time_now_monotonic_us(void) { return now_us; }
++const char *chiaki_error_string(ChiakiErrorCode err) { (void)err; return "test error"; }
++ChiakiErrorCode stream_connection_send_idr_request(ChiakiStreamConnection *stream)
++{
++	(void)stream; requests++;
++	return fail_request ? CHIAKI_ERR_NETWORK : CHIAKI_ERR_SUCCESS;
++}
++ChiakiErrorCode stream_connection_send_corrupt_frame(ChiakiStreamConnection *stream, ChiakiSeqNum16 start, ChiakiSeqNum16 end)
++{
++	(void)stream; (void)start; (void)end;
++	return CHIAKI_ERR_SUCCESS;
++}
++void chiaki_session_send_event(ChiakiSession *session, ChiakiEvent *event) { (void)session; (void)event; }
++
++static bool sample_cb(uint8_t *buf, size_t size, int32_t lost, bool recovered, void *user)
++{
++	(void)buf; (void)size; (void)recovered; (void)user;
++	delivered_lost = lost; delivered++;
++	return !reject_sample;
++}
++
++static void init_receiver(ChiakiVideoReceiver *receiver, ChiakiSession *session)
++{
++	memset(session, 0, sizeof(*session));
++	chiaki_log_init(&quiet_log, 0, NULL, NULL);
++	session->log = &quiet_log;
++	session->connect_info.video_profile.codec = CHIAKI_CODEC_H264;
++	session->video_sample_cb = sample_cb;
++	chiaki_video_receiver_init(receiver, session, NULL);
++	receiver->profiles_count = 1;
++	receiver->profile_cur = 0;
++	now_us = 1000; requests = delivered = 0;
++	fail_request = reject_sample = false;
++	delivered_lost = -1;
++}
++
++static void send_frame(ChiakiVideoReceiver *receiver, uint16_t index, bool complete)
++{
++	// Source units carry two padding bytes followed by encoded payload.
++	uint8_t data[8] = { 0, 0, 0, 0, 0, 1, 0x09, 0x10 };
++	ChiakiTakionAVPacket packet = { 0 };
++	packet.is_video = true;
++	packet.frame_index = index;
++	packet.units_in_frame_total = complete ? 2 : 3;
++	packet.units_in_frame_fec = 1;
++	packet.unit_index = complete ? 0 : 2;
++	packet.data = data;
++	packet.data_size = sizeof(data);
++	chiaki_video_receiver_av_packet(receiver, &packet);
++}
++
++static MunitResult test_loss_accounting(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	ChiakiSession session; ChiakiVideoReceiver receiver;
++	init_receiver(&receiver, &session);
++	send_frame(&receiver, 100, true);
++	munit_assert_int(delivered_lost, ==, 0);
++	for(unsigned i=101; i<=103; i++) send_frame(&receiver, i, false);
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, 3);
++	send_frame(&receiver, 104, true);
++	munit_assert_int(delivered_lost, ==, 3);
++	send_frame(&receiver, 107, true);
++	munit_assert_int(delivered_lost, ==, 2);
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, 5);
++	// A duplicate or older frame cannot count a loss twice.
++	send_frame(&receiver, 106, false);
++	send_frame(&receiver, 107, true);
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, 5);
++	reject_sample = true;
++	send_frame(&receiver, 108, true);
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, 6);
++	reject_sample = false;
++	send_frame(&receiver, 109, true);
++	munit_assert_int(delivered_lost, ==, 1);
++	chiaki_video_receiver_fini(&receiver);
++	return MUNIT_OK;
++}
++
++static MunitResult test_wrap_accounting(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	ChiakiSession session; ChiakiVideoReceiver receiver;
++	init_receiver(&receiver, &session);
++	send_frame(&receiver, 65534, true);
++	send_frame(&receiver, 65535, false);
++	send_frame(&receiver, 0, false);
++	send_frame(&receiver, 1, true);
++	munit_assert_int(delivered_lost, ==, 2);
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, 2);
++	// A completely missing frame spanning the wrap is also counted once.
++	chiaki_video_receiver_fini(&receiver);
++	init_receiver(&receiver, &session);
++	send_frame(&receiver, 65534, true);
++	send_frame(&receiver, 1, true);
++	munit_assert_int(delivered_lost, ==, 2);
++	receiver.frames_lost_total = INT32_MAX;
++	send_frame(&receiver, 2, false);
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, INT32_MAX);
++	chiaki_video_receiver_fini(&receiver);
++	return MUNIT_OK;
++}
++
++static MunitResult test_bounded_recovery(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	ChiakiSession session; ChiakiVideoReceiver receiver;
++	init_receiver(&receiver, &session);
++	fail_request = true;
++	munit_assert_int(chiaki_video_receiver_request_idr(&receiver), ==, CHIAKI_ERR_NETWORK);
++	munit_assert_true(chiaki_video_receiver_get_waiting_for_idr(&receiver));
++	for(unsigned i=0; i<50; i++) chiaki_video_receiver_request_idr(&receiver);
++	munit_assert_uint(requests, ==, 1);
++	// A malformed/non-IDR frame must not bypass the recovery gate.
++	send_frame(&receiver, 10, true);
++	munit_assert_uint(delivered, ==, 0);
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, 1);
++	now_us += 999999;
++	chiaki_video_receiver_poll_recovery(&receiver);
++	munit_assert_uint(requests, ==, 1);
++	now_us++;
++	fail_request = false;
++	chiaki_video_receiver_poll_recovery(&receiver);
++	munit_assert_uint(requests, ==, 2);
++	now_us += 1000000;
++	chiaki_video_receiver_poll_recovery(&receiver);
++	munit_assert_uint(requests, ==, 3);
++	now_us += 1000000;
++	chiaki_video_receiver_poll_recovery(&receiver);
++	munit_assert_false(chiaki_video_receiver_get_waiting_for_idr(&receiver));
++	munit_assert_uint(requests, ==, 3);
++	send_frame(&receiver, 11, true);
++	munit_assert_uint(delivered, ==, 1);
++	chiaki_video_receiver_request_idr(&receiver);
++	chiaki_video_receiver_set_waiting_for_idr(&receiver, false);
++	now_us += 1000000;
++	chiaki_video_receiver_poll_recovery(&receiver);
++	munit_assert_uint(requests, ==, 4);
++	chiaki_video_receiver_fini(&receiver);
++	return MUNIT_OK;
++}
++
++static MunitResult test_idr_arrival(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	// Existing bitstream fixtures, with source-unit padding prepended.
++	uint8_t h264[] = { 0, 0,
++		0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x80, 0x82, 0x1f, 0x00, 0x49, 0xee, 0x03, 0x29, 0xff, 0xf8,
++		0x7f, 0x88, 0x46, 0x44, 0x77, 0x17, 0xe7, 0x6d, 0xb3, 0xad, 0x38, 0x19, 0x74, 0x5a, 0xf1, 0x51 };
++	uint8_t h265[] = { 0, 0,
++		0x00, 0x00, 0x00, 0x01, 0x28, 0x01, 0xac, 0x25, 0xcf, 0x83, 0xff, 0x23, 0x54, 0xab, 0x5c, 0xf5,
++		0x7a, 0x06, 0x7c, 0x3f, 0x31, 0x9b, 0xe6, 0x10, 0x57, 0xe8, 0x0e, 0xcf, 0xdd, 0xda, 0xdb, 0x3f };
++	for(unsigned int codec = 0; codec < 2; codec++)
++	{
++		ChiakiSession session; ChiakiVideoReceiver receiver;
++		init_receiver(&receiver, &session);
++		chiaki_bitstream_init(&receiver.bitstream, &quiet_log, codec ? CHIAKI_CODEC_H265 : CHIAKI_CODEC_H264);
++		if(!codec) receiver.bitstream.h264.sps.log2_max_frame_num_minus4 = 3;
++		receiver.reference_frames[0] = 42;
++		chiaki_video_receiver_request_idr(&receiver);
++		ChiakiTakionAVPacket packet = { 0 };
++		packet.is_video = true; packet.frame_index = 100;
++		packet.units_in_frame_total = 2; packet.units_in_frame_fec = 1;
++		packet.data = codec ? h265 : h264; packet.data_size = sizeof(h264);
++		chiaki_video_receiver_av_packet(&receiver, &packet);
++		munit_assert_false(chiaki_video_receiver_get_waiting_for_idr(&receiver));
++		munit_assert_uint(delivered, ==, 1);
++		munit_assert_int(delivered_lost, ==, 0);
++		for(unsigned int i = 0; i < 16; i++)
++			munit_assert_int(receiver.reference_frames[i], !=, 42);
++		now_us += 1000000;
++		chiaki_video_receiver_poll_recovery(&receiver);
++		munit_assert_uint(requests, ==, 1);
++		chiaki_video_receiver_fini(&receiver);
++	}
++	return MUNIT_OK;
++}
++
++static MunitResult test_fec_recovery_option(const MunitParameter params[], void *user)
++{
++	(void)params; (void)user;
++	ChiakiSession session; ChiakiVideoReceiver receiver;
++	init_receiver(&receiver, &session);
++	send_frame(&receiver, 1, false);
++	munit_assert_uint(requests, ==, 0);
++	session.connect_info.enable_idr_on_fec_failure = true;
++	send_frame(&receiver, 2, false);
++	send_frame(&receiver, 3, false);
++	munit_assert_uint(requests, ==, 1);
++	munit_assert_true(chiaki_video_receiver_get_waiting_for_idr(&receiver));
++	munit_assert_int(chiaki_video_receiver_get_frames_lost_total(&receiver), ==, 3);
++	chiaki_video_receiver_fini(&receiver);
++	return MUNIT_OK;
++}
++
++static MunitTest tests[] = {
++	{ "/idr_arrival", test_idr_arrival, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/fec_recovery_option", test_fec_recovery_option, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/loss_accounting", test_loss_accounting, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/wrap_accounting", test_wrap_accounting, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/bounded_recovery", test_bounded_recovery, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ NULL, NULL, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL }
++};
++int main(int argc, char **argv)
++{
++	MunitSuite suite = { "/video_receiver", tests, NULL, 1, MUNIT_SUITE_OPTION_NONE };
++	return munit_suite_main(&suite, NULL, argc, argv);
++}
