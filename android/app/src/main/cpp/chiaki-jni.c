@@ -231,6 +231,8 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	ChiakiConnectInfo connect_info = { 0 };
 	connect_info.ps5 = ps5;
 
+	// Comunicar las pérdidas medidas para permitir adaptar el stream.
+	connect_info.packet_loss_max = 1.0;
 	const char *str_borrow = E->GetStringUTFChars(env, host_string, NULL);
 	connect_info.host = host_str = strdup(str_borrow);
 	E->ReleaseStringUTFChars(env, host_string, str_borrow);
