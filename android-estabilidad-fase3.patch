@@ -1,0 +1,189 @@
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 9944608..28eef44 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
+ 
+ #include "video-decoder.h"
++#include "video-pacing.h"
+ 
+ #include <jni.h>
+ 
+@@ -26,6 +27,8 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
+ 	decoder->timestamp_origin = 0;
+ 	decoder->last_input_time = 0;
+ 	atomic_init(&decoder->input_gap_max_us, 0);
++	atomic_init(&decoder->reported_lost_frames, 0);
++	atomic_init(&decoder->recovered_samples, 0);
+ 	decoder->low_latency = false;
+ 	decoder->diagnostics = true;
+ 	atomic_init(&decoder->samples_submitted, 0);
+@@ -183,6 +186,8 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
+ 	bool r = true;
+ 	uint64_t input_time = chiaki_time_now_monotonic_us();
+ 	AndroidChiakiVideoDecoder *decoder = user;
++	if(frames_lost > 0) atomic_fetch_add(&decoder->reported_lost_frames, (uint64_t)frames_lost);
++	if(frame_recovered) atomic_fetch_add(&decoder->recovered_samples, 1);
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+ 
+ 	if(!decoder->codec || atomic_load(&decoder->shutdown_output))
+@@ -261,6 +266,9 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 	uint64_t report_start = chiaki_time_now_monotonic_us();
+ 	uint64_t last_output = 0, output_count = 0, max_gap = 0, long_gaps = 0;
+ 	uint64_t release_errors = 0;
++	AndroidVideoPacing pacing = {0};
++	uint64_t pacing_drops = 0, pacing_rebases = 0, max_schedule_ahead_us = 0;
++	CHIAKI_LOGI(decoder->log, "[android-pacing] enabled=%d horizon_frames=2", CHIAKI_ANDROID_VIDEO_PACING);
+ 	uint64_t gap_threshold_us = 1500000 / (decoder->target_fps ? decoder->target_fps : 60);
+ 	while(!atomic_load(&decoder->shutdown_output))
+ 	{
+@@ -271,7 +279,28 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 		if(status >= 0)
+ 		{
+ 			bool render = info.size != 0 && !(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG);
+-			media_status_t result = AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);
++			media_status_t result;
++            if(render && CHIAKI_ANDROID_VIDEO_PACING)
++            {
++                uint64_t now_ns = chiaki_time_now_monotonic_us() * 1000;
++                bool rebased;
++                uint64_t target = android_video_pacing_target(&pacing, now_ns, decoder->target_fps, &rebased);
++                if(rebased) pacing_rebases++;
++                if(target)
++                {
++                    uint64_t ahead = (target - now_ns) / 1000;
++                    if(ahead > max_schedule_ahead_us) max_schedule_ahead_us = ahead;
++                    result = AMediaCodec_releaseOutputBufferAtTime(decoder->codec, (size_t)status, (int64_t)target);
++                }
++                else
++                {
++                    render = false;
++                    pacing_drops++;
++                    result = AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, false);
++                }
++            }
++            else
++                result = AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);
+ 			if(result != AMEDIA_OK)
+ 				release_errors++;
+ 			if(render && result == AMEDIA_OK)
+@@ -304,7 +333,14 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 				atomic_exchange(&decoder->oversize_samples, 0),
+ 				atomic_exchange(&decoder->input_wait_max_us, 0),
+ 				atomic_exchange(&decoder->input_gap_max_us, 0), release_errors);
+-			report_start = now;
++			CHIAKI_LOGI(decoder->log, "[android-pacing] scheduled_or_released=%" PRIu64
++                " dropped_backlog=%" PRIu64 " rebases=%" PRIu64 " max_schedule_ahead_us=%" PRIu64
++                " reported_lost_frames=%" PRIuFAST64 " recovered_samples=%" PRIuFAST64,
++                output_count, pacing_drops, pacing_rebases, max_schedule_ahead_us,
++                atomic_exchange(&decoder->reported_lost_frames, 0),
++                atomic_exchange(&decoder->recovered_samples, 0));
++            pacing_drops = pacing_rebases = max_schedule_ahead_us = 0;
++            report_start = now;
+ 			output_count = max_gap = long_gaps = release_errors = 0;
+ 		}
+ 	}
+diff --git a/android/app/src/main/cpp/video-decoder.h b/android/app/src/main/cpp/video-decoder.h
+index 47eba02..70fdc9e 100644
+--- a/android/app/src/main/cpp/video-decoder.h
++++ b/android/app/src/main/cpp/video-decoder.h
+@@ -22,6 +22,8 @@ typedef struct android_chiaki_video_decoder_t
+ 	uint64_t timestamp_origin;
+ 	uint64_t last_input_time;
+ 	atomic_uint_fast64_t input_gap_max_us;
++	atomic_uint_fast64_t reported_lost_frames;
++	atomic_uint_fast64_t recovered_samples;
+ 	bool low_latency;
+ 	bool diagnostics;
+ 	atomic_uint_fast64_t samples_submitted;
+diff --git a/android/app/src/main/cpp/video-pacing.h b/android/app/src/main/cpp/video-pacing.h
+new file mode 100644
+index 0000000..6d1b4b3
+--- /dev/null
++++ b/android/app/src/main/cpp/video-pacing.h
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++#pragma once
++#include <stdint.h>
++#include <stdbool.h>
++#ifndef CHIAKI_ANDROID_VIDEO_PACING
++#define CHIAKI_ANDROID_VIDEO_PACING 1
++#endif
++// Monotonic nanoseconds; a bounded Surface schedule, not a network jitter buffer.
++typedef struct { uint64_t next_ns; } AndroidVideoPacing;
++static inline uint64_t android_video_pacing_target(AndroidVideoPacing *p,
++        uint64_t now_ns, unsigned fps, bool *rebased)
++{
++    if(fps != 30 && fps != 60) fps = 60;
++    const uint64_t interval = 1000000000ULL / fps;
++    *rebased = false;
++    if(!p->next_ns || p->next_ns < now_ns)
++    {
++        *rebased = p->next_ns != 0;
++        p->next_ns = now_ns + interval;
++    }
++    // Do not build an unbounded Surface queue if a burst outruns presentation.
++    if(p->next_ns > now_ns + 2 * interval) return 0;
++    uint64_t target = p->next_ns;
++    p->next_ns += interval;
++    return target;
++}
+diff --git a/test/android-stubs/media/NdkMediaCodec.h b/test/android-stubs/media/NdkMediaCodec.h
+index e1087a8..f49b2ac 100644
+--- a/test/android-stubs/media/NdkMediaCodec.h
++++ b/test/android-stubs/media/NdkMediaCodec.h
+@@ -22,3 +22,5 @@ uint8_t *AMediaCodec_getOutputBuffer(AMediaCodec *, size_t, size_t *);
+ media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *, size_t, off_t, size_t, uint64_t, uint32_t);
+ ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *, AMediaCodecBufferInfo *, int64_t);
+ media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *, size_t, _Bool);
++
++media_status_t AMediaCodec_releaseOutputBufferAtTime(AMediaCodec *, size_t, int64_t);
+diff --git a/test/android_decoder_lifecycle.c b/test/android_decoder_lifecycle.c
+index 3c23c1c..a1c1663 100644
+--- a/test/android_decoder_lifecycle.c
++++ b/test/android_decoder_lifecycle.c
+@@ -5,6 +5,8 @@
+ #include <stdatomic.h>
+ #include <unistd.h>
+ #include <stdio.h>
++#include <chiaki/time.h>
++#include "../android/app/src/main/cpp/video-pacing.h"
+ #include <media/NdkMediaCodec.h>
+ #include <android/native_window_jni.h>
+ #include "../android/app/src/main/cpp/video-decoder.h"
+@@ -62,10 +64,34 @@ ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c,AMediaCodecBufferInfo *i,
+  }
+  return -1; }
+ media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *c,size_t i,_Bool r) { (void)c;(void)i;if(r)atomic_fetch_add(&rendered_outputs,1);return 0; }
++media_status_t AMediaCodec_releaseOutputBufferAtTime(AMediaCodec *c,size_t i,int64_t target) {
++ uint64_t now=chiaki_time_now_monotonic_us()*1000;
++ assert(target>0 && (uint64_t)target<=now+33333334ULL);
++ return AMediaCodec_releaseOutputBuffer(c,i,true);
++}
++static void test_pacing(void) {
++ for(unsigned fps=30;fps<=60;fps+=30) {
++  uint64_t interval=1000000000ULL/fps, now=1000000000ULL;
++  AndroidVideoPacing p={0};bool rebased;
++  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+interval && !rebased);
++  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+2*interval);
++  assert(android_video_pacing_target(&p,now,fps,&rebased)==0);
++  now+=interval;
++  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+2*interval);
++  now+=10*interval;
++  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+interval && rebased);
++  for(int n=0;n<10000;n++) {
++   now+=interval;
++   uint64_t target=android_video_pacing_target(&p,now,fps,&rebased);
++   assert(target==now+interval && !rebased);
++  }
++ }
++}
+ static void *check_unlocked(void *arg) { ChiakiMutex *m=arg;assert(chiaki_mutex_trylock(m)==CHIAKI_ERR_SUCCESS);chiaki_mutex_unlock(m);return NULL; }
+ static void unlocked(ChiakiMutex *m) { ChiakiThread t;assert(chiaki_thread_create(&t,check_unlocked,m)==CHIAKI_ERR_SUCCESS);chiaki_thread_join(&t,NULL); }
+ int main(void)
+ {
++ test_pacing();
+  ChiakiLog log;chiaki_log_init(&log,CHIAKI_LOG_ALL,capture_log,NULL);
+  AndroidChiakiVideoDecoder v;
+  assert(android_chiaki_video_decoder_init(&v,&log,1280,720,CHIAKI_CODEC_H264)==CHIAKI_ERR_SUCCESS);

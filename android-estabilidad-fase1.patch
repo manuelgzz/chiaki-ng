@@ -619,3 +619,4 @@ index 0000000..5b03474
 +  -pthread -o "$build_dir/android-lifecycle"
 +ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
 +  timeout 15 "$build_dir/android-lifecycle"
+
