@@ -198,13 +198,22 @@ CHIAKI_EXPORT bool chiaki_ffmpeg_decoder_video_sample_cb(uint8_t *buf, size_t bu
 #endif
 	decoder->synthetic_packet_pts += synthetic_duration_pts;
 	int r;
+	// FFmpeg requires draining output before retrying EAGAIN. Bound the
+	// recovery loop so a stalled decoder cannot block the network thread.
+	unsigned int backpressure_drops = 0;
+	const unsigned int max_backpressure_drops = 8;
 send_packet:
 	r = avcodec_send_packet(decoder->codec_context, packet);
 	if(r != 0)
 	{
 		if(r == AVERROR(EAGAIN))
 		{
-			CHIAKI_LOGW(decoder->log, "AVCodec internal buffer is full, dropping a decoded frame to push new packet");
+			if(backpressure_drops >= max_backpressure_drops)
+			{
+				CHIAKI_LOGW(decoder->log, "AVCodec backpressure persisted after %u drained frames; dropping incoming packet", backpressure_drops);
+				decoder->frames_lost++;
+				goto drop_packet;
+			}
 			AVFrame *frame = av_frame_alloc();
 			if(!frame)
 			{
@@ -219,6 +228,9 @@ send_packet:
 				goto hell;
 			}
 			decoder->frames_lost++;
+			backpressure_drops++;
+			if(backpressure_drops == 1)
+				CHIAKI_LOGW(decoder->log, "AVCodec backpressure: draining stale decoded frames to preserve low latency");
 			goto send_packet;
 		}
 		else
@@ -232,6 +244,10 @@ send_packet:
 	av_packet_free(&packet);
 	chiaki_mutex_unlock(&decoder->mutex);
 	decoder->frame_available_cb(decoder, decoder->frame_available_cb_user);
+	return true;
+drop_packet:
+	av_packet_free(&packet);
+	chiaki_mutex_unlock(&decoder->mutex);
 	return true;
 hell:
 	av_packet_free(&packet);
