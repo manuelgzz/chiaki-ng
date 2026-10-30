@@ -1,0 +1,32 @@
+name: Linux experimental build
+
+on:
+  push:
+    branches: [linux-optimization]
+  workflow_dispatch:
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential pkg-config \
+            libssl-dev libopus-dev libavcodec-dev libavutil-dev \
+            libavformat-dev libswscale-dev libjson-c-dev libcurl4-openssl-dev \
+            libudev-dev libprotobuf-c-dev libminiupnpc-dev
+      - name: Configure core decoder build
+        run: |
+          cmake -S . -B build-linux -G Ninja \
+            -DCHIAKI_ENABLE_GUI=OFF \
+            -DCHIAKI_ENABLE_BOREALIS=OFF \
+            -DCHIAKI_ENABLE_TESTS=OFF \
+            -DCHIAKI_ENABLE_CLI=OFF \
+            -DCHIAKI_ENABLE_FFMPEG_DECODER=ON \
+            -DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF
+      - name: Compile
+        run: cmake --build build-linux --parallel 2
