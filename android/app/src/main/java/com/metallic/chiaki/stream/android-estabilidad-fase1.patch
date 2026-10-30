@@ -1,0 +1,621 @@
+diff --git a/android/app/src/main/cpp/audio-decoder.c b/android/app/src/main/cpp/audio-decoder.c
+index 35f97e9..c4ccbad 100644
+--- a/android/app/src/main/cpp/audio-decoder.c
++++ b/android/app/src/main/cpp/audio-decoder.c
+@@ -20,6 +20,8 @@ ChiakiErrorCode android_chiaki_audio_decoder_init(AndroidChiakiAudioDecoder *dec
+ 	decoder->log = log;
+ 	memset(&decoder->audio_header, 0, sizeof(decoder->audio_header));
+ 	decoder->codec = NULL;
++	decoder->output_thread_started = false;
++	decoder->shutdown_output = false;
+ 	decoder->timestamp_cur = 0;
+ 
+ 	decoder->cb_user = NULL;
+@@ -32,18 +34,21 @@ ChiakiErrorCode android_chiaki_audio_decoder_init(AndroidChiakiAudioDecoder *dec
+ void android_chiaki_audio_decoder_shutdown_codec(AndroidChiakiAudioDecoder *decoder)
+ {
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+-	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, -1);
+-	if(codec_buf_index >= 0)
++	decoder->shutdown_output = true;
++	chiaki_mutex_unlock(&decoder->codec_mutex);
++	if(decoder->output_thread_started)
++	{
++		chiaki_thread_join(&decoder->output_thread, NULL);
++		decoder->output_thread_started = false;
++	}
++	chiaki_mutex_lock(&decoder->codec_mutex);
++	if(decoder->codec)
+ 	{
+-		CHIAKI_LOGI(decoder->log, "Audio Decoder sending EOS buffer");
+-		AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, 0, decoder->timestamp_cur++, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
++		AMediaCodec_stop(decoder->codec);
++		AMediaCodec_delete(decoder->codec);
++		decoder->codec = NULL;
+ 	}
+-	else
+-		CHIAKI_LOGE(decoder->log, "Failed to get input buffer for shutting down Audio Decoder!");
+ 	chiaki_mutex_unlock(&decoder->codec_mutex);
+-	chiaki_thread_join(&decoder->output_thread, NULL);
+-	AMediaCodec_delete(decoder->codec);
+-	decoder->codec = NULL;
+ }
+ 
+ void android_chiaki_audio_decoder_fini(AndroidChiakiAudioDecoder *decoder)
+@@ -66,17 +71,25 @@ static void *android_chiaki_audio_decoder_output_thread_func(void *user)
+ 
+ 	while(1)
+ 	{
++		chiaki_mutex_lock(&decoder->codec_mutex);
++		bool stopping = decoder->shutdown_output;
++		chiaki_mutex_unlock(&decoder->codec_mutex);
++		if(stopping)
++			break;
+ 		AMediaCodecBufferInfo info;
+-		ssize_t codec_buf_index = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
++		ssize_t codec_buf_index = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 10000);
+ 		if(codec_buf_index >= 0)
+ 		{
+-			if(decoder->settings_cb)
++			if(decoder->frame_cb)
+ 			{
+ 				size_t codec_buf_size;
+ 				uint8_t *codec_buf = AMediaCodec_getOutputBuffer(decoder->codec, (size_t)codec_buf_index, &codec_buf_size);
+ 				size_t samples_count = info.size / sizeof(int16_t);
+ 				//CHIAKI_LOGD(decoder->log, "Got %llu samples => %f ms of audio", (unsigned long long)samples_count, 1000.0f * (float)(samples_count / 2) / (float)decoder->audio_header.rate);
+-				decoder->frame_cb((int16_t *)codec_buf, samples_count, decoder->cb_user);
++				if(codec_buf && info.offset >= 0 && info.size >= 0
++					&& (size_t)info.offset <= codec_buf_size
++					&& (size_t)info.size <= codec_buf_size - (size_t)info.offset)
++					decoder->frame_cb((int16_t *)(codec_buf + info.offset), samples_count, decoder->cb_user);
+ 			}
+ 			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)codec_buf_index, false);
+ 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+@@ -95,14 +108,13 @@ static void *android_chiaki_audio_decoder_output_thread_func(void *user)
+ static void android_chiaki_audio_decoder_header(ChiakiAudioHeader *header, void *user)
+ {
+ 	AndroidChiakiAudioDecoder *decoder = user;
+-	chiaki_mutex_lock(&decoder->codec_mutex);
+-	memcpy(&decoder->audio_header, header, sizeof(decoder->audio_header));
+-
++	// Header delivery is serialized by the network receiver. Stop the old
++	// worker before changing its format, without holding the codec mutex.
+ 	if(decoder->codec)
+-	{
+-		CHIAKI_LOGI(decoder->log, "Audio decoder already initialized, shutting down the old one");
+ 		android_chiaki_audio_decoder_shutdown_codec(decoder);
+-	}
++	chiaki_mutex_lock(&decoder->codec_mutex);
++	decoder->shutdown_output = false;
++	memcpy(&decoder->audio_header, header, sizeof(decoder->audio_header));
+ 
+ 	const char *mime = "audio/opus";
+ 	decoder->codec = AMediaCodec_createDecoderByType(mime);
+@@ -113,23 +125,28 @@ static void android_chiaki_audio_decoder_header(ChiakiAudioHeader *header, void
+ 	}
+ 
+ 	AMediaFormat *format = AMediaFormat_new();
++	if(!format)
++		goto error_codec;
+ 	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_CHANNEL_COUNT, header->channels);
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, header->rate);
+ 	// AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PCM_ENCODING)
+ 
+-	AMediaCodec_configure(decoder->codec, format, NULL, NULL, 0); // TODO: check result
+-	AMediaCodec_start(decoder->codec); // TODO: check result
+-
++	media_status_t result = AMediaCodec_configure(decoder->codec, format, NULL, NULL, 0);
+ 	AMediaFormat_delete(format);
++	if(result != AMEDIA_OK || AMediaCodec_start(decoder->codec) != AMEDIA_OK)
++	{
++		CHIAKI_LOGE(decoder->log, "Failed to configure/start audio decoder");
++		goto error_codec;
++	}
+ 
+ 	ChiakiErrorCode err = chiaki_thread_create(&decoder->output_thread, android_chiaki_audio_decoder_output_thread_func, decoder);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		CHIAKI_LOGE(decoder->log, "Failed to create output thread for AMediaCodec");
+-		AMediaCodec_delete(decoder->codec);
+-		decoder->codec = NULL;
++		goto error_codec;
+ 	}
++	decoder->output_thread_started = true;
+ 
+ 	uint8_t opus_id_head[0x13];
+ 	memcpy(opus_id_head, "OpusHead", 8);
+@@ -162,6 +179,11 @@ static void android_chiaki_audio_decoder_header(ChiakiAudioHeader *header, void
+ 	if(decoder->settings_cb)
+ 		decoder->settings_cb(header->channels, header->rate, decoder->cb_user);
+ 
++	goto beach;
++error_codec:
++	AMediaCodec_stop(decoder->codec);
++	AMediaCodec_delete(decoder->codec);
++	decoder->codec = NULL;
+ beach:
+ 	chiaki_mutex_unlock(&decoder->codec_mutex);
+ }
+@@ -171,7 +193,7 @@ static void android_chiaki_audio_decoder_frame(uint8_t *buf, size_t buf_size, vo
+ 	AndroidChiakiAudioDecoder *decoder = user;
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+ 
+-	if(!decoder->codec)
++	if(!decoder->codec || decoder->shutdown_output)
+ 	{
+ 		CHIAKI_LOGE(decoder->log, "Received audio data, but decoder is not initialized!");
+ 		goto beach;
+@@ -183,11 +205,13 @@ static void android_chiaki_audio_decoder_frame(uint8_t *buf, size_t buf_size, vo
+ 		if(codec_buf_index < 0)
+ 		{
+ 			CHIAKI_LOGE(decoder->log, "Failed to get input audio buffer");
+-			return;
++			goto beach;
+ 		}
+ 
+ 		size_t codec_buf_size;
+ 		uint8_t *codec_buf = AMediaCodec_getInputBuffer(decoder->codec, (size_t)codec_buf_index, &codec_buf_size);
++		if(!codec_buf || codec_buf_size == 0)
++			goto beach;
+ 		size_t codec_sample_size = buf_size;
+ 		if(codec_sample_size > codec_buf_size)
+ 		{
+diff --git a/android/app/src/main/cpp/audio-decoder.h b/android/app/src/main/cpp/audio-decoder.h
+index c365cd2..d108550 100644
+--- a/android/app/src/main/cpp/audio-decoder.h
++++ b/android/app/src/main/cpp/audio-decoder.h
+@@ -21,6 +21,8 @@ typedef struct android_chiaki_audio_decoder_t
+ 	struct AMediaCodec *codec;
+ 	uint64_t timestamp_cur;
+ 	ChiakiThread output_thread;
++	bool output_thread_started;
++	bool shutdown_output;
+ 
+ 	AndroidChiakiAudioDecoderSettingsCallback settings_cb;
+ 	AndroidChiakiAudioDecoderFrameCallback frame_cb;
+diff --git a/android/app/src/main/cpp/audio-output.cpp b/android/app/src/main/cpp/audio-output.cpp
+index 53157f1..0197514 100644
+--- a/android/app/src/main/cpp/audio-output.cpp
++++ b/android/app/src/main/cpp/audio-output.cpp
+@@ -70,7 +70,10 @@ extern "C" void android_chiaki_audio_output_settings(uint32_t channels, uint32_t
+ 	if(result == oboe::Result::OK)
+ 		CHIAKI_LOGI(ao->log, "Audio Output opened Oboe stream");
+ 	else
++	{
+ 		CHIAKI_LOGE(ao->log, "Audio Output failed to open Oboe stream: %s", oboe::convertToText(result));
++		return;
++	}
+ 
+ 	result = ao->stream->start();
+ 	if(result == oboe::Result::OK)
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 9ec47be..b7c07ac 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -18,6 +18,8 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
+ {
+ 	decoder->log = log;
+ 	decoder->codec = NULL;
++	decoder->window = NULL;
++	decoder->output_thread_started = false;
+ 	decoder->timestamp_cur = 0;
+ 	decoder->target_width = target_width;
+ 	decoder->target_height = target_height;
+@@ -30,24 +32,27 @@ static void kill_decoder(AndroidChiakiVideoDecoder *decoder)
+ {
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+ 	decoder->shutdown_output = true;
+-	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, 1000);
+-	if(codec_buf_index >= 0)
++	chiaki_mutex_unlock(&decoder->codec_mutex);
++	// The output worker uses finite waits and exits before the codec is freed.
++	// Never join while holding the mutex the worker needs to observe shutdown.
++	if(decoder->output_thread_started)
+ 	{
+-		CHIAKI_LOGI(decoder->log, "Video Decoder sending EOS buffer");
+-		AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, 0, decoder->timestamp_cur++, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+-		AMediaCodec_stop(decoder->codec);
+-		chiaki_mutex_unlock(&decoder->codec_mutex);
+ 		chiaki_thread_join(&decoder->output_thread, NULL);
++		decoder->output_thread_started = false;
+ 	}
+-	else
++	chiaki_mutex_lock(&decoder->codec_mutex);
++	if(decoder->codec)
+ 	{
+-		CHIAKI_LOGE(decoder->log, "Failed to get input buffer for shutting down Video Decoder!");
+ 		AMediaCodec_stop(decoder->codec);
+-		chiaki_mutex_unlock(&decoder->codec_mutex);
++		AMediaCodec_delete(decoder->codec);
++		decoder->codec = NULL;
+ 	}
+-	AMediaCodec_delete(decoder->codec);
+-	decoder->codec = NULL;
+-	decoder->shutdown_output = false;
++	if(decoder->window)
++	{
++		ANativeWindow_release(decoder->window);
++		decoder->window = NULL;
++	}
++	chiaki_mutex_unlock(&decoder->codec_mutex);
+ }
+ 
+ void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder)
+@@ -59,24 +64,29 @@ void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder)
+ 
+ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder, JNIEnv *env, jobject surface)
+ {
+-	chiaki_mutex_lock(&decoder->codec_mutex);
+-
++	// Surface operations are serialized by the session's lifecycle owner.
+ 	if(!surface)
+ 	{
+-		if(decoder->codec)
+-		{
+-			kill_decoder(decoder);
+-			CHIAKI_LOGI(decoder->log, "Decoder shut down after surface was removed");
+-		}
++		kill_decoder(decoder);
+ 		return;
+ 	}
++	chiaki_mutex_lock(&decoder->codec_mutex);
++	decoder->shutdown_output = false;
+ 
+ 	if(decoder->codec)
+ 	{
+-#if __ANDROID_API__ >= 23
++#if __ANDROID_API__ >= 24
+ 		CHIAKI_LOGI(decoder->log, "Video decoder already initialized, swapping surface");
+ 		ANativeWindow *new_window = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
+-		AMediaCodec_setOutputSurface(decoder->codec, new_window);
++		if(!new_window)
++			goto beach;
++		media_status_t swap_result = AMediaCodec_setOutputSurface(decoder->codec, new_window);
++		if(swap_result != AMEDIA_OK)
++		{
++			CHIAKI_LOGE(decoder->log, "Failed to swap decoder surface: %d", (int)swap_result);
++			ANativeWindow_release(new_window);
++			goto beach;
++		}
+ 		ANativeWindow_release(decoder->window);
+ 		decoder->window = new_window;
+ #else
+@@ -86,6 +96,8 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
+ 	}
+ 
+ 	decoder->window = ANativeWindow_fromSurface(env, surface);
++	if(!decoder->window)
++		goto beach;
+ 
+ 	const char *mime = chiaki_codec_is_h265(decoder->target_codec) ? "video/hevc" : "video/avc";
+ 	CHIAKI_LOGI(decoder->log, "Initializing decoder with mime %s", mime);
+@@ -98,6 +110,8 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
+ 	}
+ 
+ 	AMediaFormat *format = AMediaFormat_new();
++	if(!format)
++		goto error_codec;
+ 	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
+@@ -125,6 +139,7 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
+ 		goto error_codec;
+ 	}
+ 
++	decoder->output_thread_started = true;
+ 	goto beach;
+ 
+ error_codec:
+@@ -145,8 +160,9 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
+ 	AndroidChiakiVideoDecoder *decoder = user;
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+ 
+-	if(!decoder->codec)
++	if(!decoder->codec || decoder->shutdown_output)
+ 	{
++		r = false;
+ 		CHIAKI_LOGE(decoder->log, "Received video data, but decoder is not initialized!");
+ 		goto beach;
+ 	}
+@@ -163,6 +179,11 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
+ 
+ 		size_t codec_buf_size;
+ 		uint8_t *codec_buf = AMediaCodec_getInputBuffer(decoder->codec, (size_t)codec_buf_index, &codec_buf_size);
++		if(!codec_buf || codec_buf_size == 0)
++		{
++			r = false;
++			goto beach;
++		}
+ 		size_t codec_sample_size = buf_size;
+ 		if(codec_sample_size > codec_buf_size)
+ 		{
+@@ -170,10 +191,12 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
+ 			codec_sample_size = codec_buf_size;
+ 		}
+ 		memcpy(codec_buf, buf, codec_sample_size);
+-		media_status_t r = AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, codec_sample_size, decoder->timestamp_cur++, 0); // timestamp just raised by 1 for maximum realtime
+-		if(r != AMEDIA_OK)
++		media_status_t queue_result = AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, codec_sample_size, decoder->timestamp_cur++, 0); // timestamp just raised by 1 for maximum realtime
++		if(queue_result != AMEDIA_OK)
+ 		{
+-			CHIAKI_LOGE(decoder->log, "AMediaCodec_queueInputBuffer() failed: %d", (int)r);
++			CHIAKI_LOGE(decoder->log, "AMediaCodec_queueInputBuffer() failed: %d", (int)queue_result);
++			r = false;
++			goto beach;
+ 		}
+ 		buf += codec_sample_size;
+ 		buf_size -= codec_sample_size;
+@@ -191,8 +214,13 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 
+ 	while(1)
+ 	{
++		chiaki_mutex_lock(&decoder->codec_mutex);
++		bool stopping = decoder->shutdown_output;
++		chiaki_mutex_unlock(&decoder->codec_mutex);
++		if(stopping)
++			break;
+ 		AMediaCodecBufferInfo info;
+-		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
++		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 10000);
+ 		if(status >= 0)
+ 		{
+ 			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
+diff --git a/android/app/src/main/cpp/video-decoder.h b/android/app/src/main/cpp/video-decoder.h
+index f2ea0e5..dfaee21 100644
+--- a/android/app/src/main/cpp/video-decoder.h
++++ b/android/app/src/main/cpp/video-decoder.h
+@@ -20,6 +20,7 @@ typedef struct android_chiaki_video_decoder_t
+ 	uint64_t timestamp_cur;
+ 	ChiakiThread output_thread;
+ 	bool shutdown_output;
++	bool output_thread_started;
+ 	int32_t target_width;
+ 	int32_t target_height;
+ 	ChiakiCodec target_codec;
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+index df69378..23eced1 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+@@ -16,7 +16,6 @@ class StreamViewModel(val application: Application, val connectInfo: ConnectInfo
+ 	val preferences = Preferences(application)
+ 	val logManager = LogManager(application)
+ 
+-	private var _session: StreamSession? = null
+ 	val input = StreamInput(application, preferences)
+ 	val session = StreamSession(connectInfo, logManager, preferences.logVerbose, input)
+ 
+@@ -29,7 +28,7 @@ class StreamViewModel(val application: Application, val connectInfo: ConnectInfo
+ 	override fun onCleared()
+ 	{
+ 		super.onCleared()
+-		_session?.shutdown()
++		session.shutdown()
+ 	}
+ 
+ 	fun setOnScreenControlsEnabled(enabled: Boolean)
+diff --git a/docs/android-stability-phase1.md b/docs/android-stability-phase1.md
+new file mode 100644
+index 0000000..2a21a4d
+--- /dev/null
++++ b/docs/android-stability-phase1.md
+@@ -0,0 +1,45 @@
++# Android stability: native lifecycle fixes
++
++Base fork commit: 14955e5f2c5f6fe9317314a64845bcc555c808a1.
++
++This Android-only batch is independent of the Linux phase-2 patch. It fixes:
++
++- Recursive acquisition of the non-recursive video codec mutex when a Surface
++  is removed, and the null-Surface path that returned without unlocking.
++- Stop flags, finite output polling and joining output workers before codec
++  stop/delete for both video and audio. No input/EOS availability is required
++  to request cancellation. Driver calls themselves are not hard-time bounded.
++- Native window initialization, release on shutdown and checked surface swaps.
++- Video callbacks falsely returning success for an absent codec or failed
++  queueInputBuffer. Input buffer pointers/capacity and format allocation checked.
++- Audio input error returning without releasing its mutex.
++- Audio format reconfiguration joining while the outer mutex was held.
++- Audio configure/start/thread-creation failure cleanup, output callback guard,
++  PCM offset/range validation and input pointer/capacity checks.
++- Oboe open failure falling through to stream->start().
++- ViewModel cleanup referencing an unused nullable session instead of the real one.
++
++Lifecycle ownership is still serialized by the existing Kotlin/network owners;
++this is not a new general concurrent lifecycle API. Output dequeues are polled
++with a 10 ms timeout. This removes indefinite application-requested waits, but
++cannot promise a misbehaving platform driver will obey the timeout. Removing
++video Surface currently still destroys the codec, and reconstructing it still
++requires configuration/reference recovery work in a later batch.
++
++Validation: bash test/run-android-lifecycle-tests.sh builds the actual video and
++native audio decoder C files with real pthread wrappers and deterministic fake
++NDK objects. It exercises 30 video cycles, 30 audio reconfiguration cycles,
++failed input/queue/surface/configure/start operations, cross-thread lock access,
++and native resource balance. ASan/UBSan enabled; leak detection disabled because
++process inspection is restricted. Resource counts are explicitly asserted.
++
++Not validated: real MediaCodec/vendor behavior, Kotlin or Oboe compilation,
++Oboe stream routing, physical devices, full APK build, startup/playback latency.
++The mocks do not implement actual codecs. Oboe/Kotlin edits are reviewed source
++changes, not covered by the native C harness.
++
++Remaining: valid Opus CSD handling and PLC; compressed access-unit boundaries;
++codec error recovery; asynchronous session disposal; bounded receive/decode
++queues; timestamps and presentation; output-route recovery and audio latency;
++JNI diagnostics and Android settings for congestion/IDR. No claim of completed
++Android stability optimization is made by this batch.
+diff --git a/test/android-stubs/android/native_window_jni.h b/test/android-stubs/android/native_window_jni.h
+new file mode 100644
+index 0000000..d5ce0c9
+--- /dev/null
++++ b/test/android-stubs/android/native_window_jni.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include <jni.h>
++typedef struct ANativeWindow ANativeWindow;
++ANativeWindow *ANativeWindow_fromSurface(JNIEnv *, jobject);
++void ANativeWindow_release(ANativeWindow *);
+diff --git a/test/android-stubs/jni.h b/test/android-stubs/jni.h
+new file mode 100644
+index 0000000..72c179b
+--- /dev/null
++++ b/test/android-stubs/jni.h
+@@ -0,0 +1,3 @@
++#pragma once
++typedef void JNIEnv;
++typedef void *jobject;
+diff --git a/test/android-stubs/media/NdkMediaCodec.h b/test/android-stubs/media/NdkMediaCodec.h
+new file mode 100644
+index 0000000..3669c84
+--- /dev/null
++++ b/test/android-stubs/media/NdkMediaCodec.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/types.h>
++#include "NdkMediaFormat.h"
++typedef int media_status_t;
++typedef struct AMediaCodec AMediaCodec;
++typedef struct ANativeWindow ANativeWindow;
++typedef struct { int32_t offset,size; int64_t presentationTimeUs; uint32_t flags; } AMediaCodecBufferInfo;
++#define AMEDIA_OK 0
++#define AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM 4
++AMediaCodec *AMediaCodec_createDecoderByType(const char *);
++media_status_t AMediaCodec_configure(AMediaCodec *, const AMediaFormat *, ANativeWindow *, void *, uint32_t);
++media_status_t AMediaCodec_start(AMediaCodec *);
++media_status_t AMediaCodec_stop(AMediaCodec *);
++media_status_t AMediaCodec_delete(AMediaCodec *);
++media_status_t AMediaCodec_setOutputSurface(AMediaCodec *, ANativeWindow *);
++ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec *, int64_t);
++uint8_t *AMediaCodec_getInputBuffer(AMediaCodec *, size_t, size_t *);
++uint8_t *AMediaCodec_getOutputBuffer(AMediaCodec *, size_t, size_t *);
++media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *, size_t, off_t, size_t, uint64_t, uint32_t);
++ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *, AMediaCodecBufferInfo *, int64_t);
++media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *, size_t, _Bool);
+diff --git a/test/android-stubs/media/NdkMediaFormat.h b/test/android-stubs/media/NdkMediaFormat.h
+new file mode 100644
+index 0000000..451951c
+--- /dev/null
++++ b/test/android-stubs/media/NdkMediaFormat.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include <stdint.h>
++typedef struct AMediaFormat { int dummy; } AMediaFormat;
++#define AMEDIAFORMAT_KEY_MIME "mime"
++#define AMEDIAFORMAT_KEY_WIDTH "width"
++#define AMEDIAFORMAT_KEY_HEIGHT "height"
++#define AMEDIAFORMAT_KEY_CHANNEL_COUNT "channels"
++#define AMEDIAFORMAT_KEY_SAMPLE_RATE "rate"
++AMediaFormat *AMediaFormat_new(void);
++void AMediaFormat_delete(AMediaFormat *);
++void AMediaFormat_setString(AMediaFormat *, const char *, const char *);
++void AMediaFormat_setInt32(AMediaFormat *, const char *, int32_t);
+diff --git a/test/android_decoder_lifecycle.c b/test/android_decoder_lifecycle.c
+new file mode 100644
+index 0000000..f047ab3
+--- /dev/null
++++ b/test/android_decoder_lifecycle.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++#include <assert.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdatomic.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <media/NdkMediaCodec.h>
++#include <android/native_window_jni.h>
++#include "../android/app/src/main/cpp/video-decoder.h"
++#include "../android/app/src/main/cpp/audio-decoder.h"
++struct AMediaCodec { atomic_int readers; uint8_t data[256]; };
++struct ANativeWindow { int unused; };
++static int windows, codecs;
++static int fail_input, fail_queue, fail_swap, fail_configure, fail_start;
++AMediaFormat *AMediaFormat_new(void) { return calloc(1,sizeof(AMediaFormat)); }
++void AMediaFormat_delete(AMediaFormat *f) { free(f); }
++void AMediaFormat_setString(AMediaFormat *f,const char *k,const char *v) { (void)f;(void)k;(void)v; }
++void AMediaFormat_setInt32(AMediaFormat *f,const char *k,int32_t v) { (void)f;(void)k;(void)v; }
++ANativeWindow *ANativeWindow_fromSurface(JNIEnv *e,jobject s) { (void)e;(void)s;windows++;return calloc(1,sizeof(ANativeWindow)); }
++void ANativeWindow_release(ANativeWindow *w) { assert(w);windows--;free(w); }
++AMediaCodec *AMediaCodec_createDecoderByType(const char *m) { (void)m;codecs++;return calloc(1,sizeof(AMediaCodec)); }
++media_status_t AMediaCodec_configure(AMediaCodec *c,const AMediaFormat *f,ANativeWindow *w,void *x,uint32_t a) { (void)c;(void)f;(void)w;(void)x;(void)a;return fail_configure ? -1:0; }
++media_status_t AMediaCodec_start(AMediaCodec *c) { (void)c;return fail_start ? -1:0; }
++media_status_t AMediaCodec_stop(AMediaCodec *c) { assert(!atomic_load(&c->readers));return 0; }
++media_status_t AMediaCodec_delete(AMediaCodec *c) { assert(!atomic_load(&c->readers));codecs--;free(c);return 0; }
++media_status_t AMediaCodec_setOutputSurface(AMediaCodec *c,ANativeWindow *w) { (void)c;(void)w;return fail_swap ? -1:0; }
++ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec *c,int64_t t) { (void)c;(void)t;return fail_input ? -1:0; }
++uint8_t *AMediaCodec_getInputBuffer(AMediaCodec *c,size_t i,size_t *s) { (void)i;*s=sizeof(c->data);return c->data; }
++uint8_t *AMediaCodec_getOutputBuffer(AMediaCodec *c,size_t i,size_t *s) { return AMediaCodec_getInputBuffer(c,i,s); }
++media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *c,size_t i,off_t o,size_t s,uint64_t t,uint32_t f) { (void)c;(void)i;(void)o;(void)s;(void)t;(void)f;return fail_queue ? -1:0; }
++ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c,AMediaCodecBufferInfo *i,int64_t t) { (void)i;assert(t>=0);atomic_fetch_add(&c->readers,1);usleep(1000);atomic_fetch_sub(&c->readers,1);return -1; }
++media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *c,size_t i,_Bool r) { (void)c;(void)i;(void)r;return 0; }
++static void *check_unlocked(void *arg) { ChiakiMutex *m=arg;assert(chiaki_mutex_trylock(m)==CHIAKI_ERR_SUCCESS);chiaki_mutex_unlock(m);return NULL; }
++static void unlocked(ChiakiMutex *m) { ChiakiThread t;assert(chiaki_thread_create(&t,check_unlocked,m)==CHIAKI_ERR_SUCCESS);chiaki_thread_join(&t,NULL); }
++int main(void)
++{
++ ChiakiLog log;chiaki_log_init(&log,0,NULL,NULL);
++ AndroidChiakiVideoDecoder v;
++ assert(android_chiaki_video_decoder_init(&v,&log,1280,720,CHIAKI_CODEC_H264)==CHIAKI_ERR_SUCCESS);
++ uint8_t sample[4]={0};
++ assert(!android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));
++ android_chiaki_video_decoder_set_surface(&v,NULL,NULL);unlocked(&v.codec_mutex);
++ for(int n=0;n<30;n++) {
++  android_chiaki_video_decoder_set_surface(&v,NULL,(jobject)1);
++  usleep(2000);
++  assert(android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));
++  fail_input=1;assert(!android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));fail_input=0;
++  fail_queue=1;assert(!android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));fail_queue=0;
++  ANativeWindow *old=v.window;fail_swap=1;
++  android_chiaki_video_decoder_set_surface(&v,NULL,(jobject)1);assert(v.window==old && windows==1);fail_swap=0;
++  android_chiaki_video_decoder_set_surface(&v,NULL,NULL);unlocked(&v.codec_mutex);
++  assert(!v.codec && !v.window && !v.output_thread_started);assert(codecs==0 && windows==0);
++ }
++ android_chiaki_video_decoder_fini(&v);
++ AndroidChiakiAudioDecoder a;assert(android_chiaki_audio_decoder_init(&a,&log)==CHIAKI_ERR_SUCCESS);
++ a.codec=AMediaCodec_createDecoderByType("audio/opus");
++ ChiakiAudioSink sink;android_chiaki_audio_decoder_get_sink(&a,&sink);
++ fail_input=1;sink.frame_cb(sample,sizeof(sample),sink.user);unlocked(&a.codec_mutex);fail_input=0;
++ AMediaCodec_delete(a.codec);a.codec=NULL;android_chiaki_audio_decoder_fini(&a);
++ for(int n=0;n<30;n++) {
++  android_chiaki_audio_decoder_init(&a,&log);
++  android_chiaki_audio_decoder_get_sink(&a,&sink);
++  ChiakiAudioHeader header={0};header.channels=2;header.rate=48000;
++  sink.header_cb(&header,sink.user);usleep(2000);
++  sink.header_cb(&header,sink.user);usleep(2000);
++  android_chiaki_audio_decoder_fini(&a);assert(codecs==0);
++ }
++ for(int failure=0;failure<2;failure++) {
++  android_chiaki_audio_decoder_init(&a,&log);android_chiaki_audio_decoder_get_sink(&a,&sink);
++  fail_configure=failure==0;fail_start=failure==1;
++  ChiakiAudioHeader header={0};header.channels=2;header.rate=48000;
++  sink.header_cb(&header,sink.user);assert(!a.codec && !a.output_thread_started);
++  unlocked(&a.codec_mutex);android_chiaki_audio_decoder_fini(&a);
++  fail_configure=fail_start=0;assert(codecs==0);
++ }
++ puts("PASS: 30 video cycles, 30 audio reconfiguration cycles, input/queue/surface/configure/start errors, cross-thread unlock and resource balance");
++ return 0;
++}
+diff --git a/test/run-android-lifecycle-tests.sh b/test/run-android-lifecycle-tests.sh
+new file mode 100644
+index 0000000..5b03474
+--- /dev/null
++++ b/test/run-android-lifecycle-tests.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++set -euo pipefail
++repo_dir=$(cd "$(dirname "$0")/.." && pwd)
++build_dir=$(mktemp -d)
++trap 'rm -rf "$build_dir"' EXIT
++cd "$repo_dir"
++${CC:-cc} -std=gnu11 -g -D__ANDROID_API__=24 \
++  -fsanitize=address,undefined -fno-omit-frame-pointer \
++  -Itest/android-stubs -Ilib/include \
++  test/android_decoder_lifecycle.c \
++  android/app/src/main/cpp/video-decoder.c \
++  android/app/src/main/cpp/audio-decoder.c \
++  lib/src/thread.c lib/src/time.c lib/src/log.c \
++  -pthread -o "$build_dir/android-lifecycle"
++ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
++  timeout 15 "$build_dir/android-lifecycle"
