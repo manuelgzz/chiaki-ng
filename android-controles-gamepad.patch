@@ -346,7 +346,7 @@ index 822fe76..3d95c0b 100644
 +}
 diff --git a/android/app/src/main/java/com/metallic/chiaki/settings/GamepadSettingsActivity.kt b/android/app/src/main/java/com/metallic/chiaki/settings/GamepadSettingsActivity.kt
 new file mode 100644
-index 0000000..392d458
+index 0000000..bb364f3
 --- /dev/null
 +++ b/android/app/src/main/java/com/metallic/chiaki/settings/GamepadSettingsActivity.kt
 @@ -0,0 +1,140 @@
@@ -409,7 +409,7 @@ index 0000000..392d458
 +    private fun render() {
 +        content.removeAllViews()
 +        content.addView(TextView(this).apply { setText(R.string.gamepad_mapping_help) })
-+        val devices = InputDevice.getDeviceIds().mapNotNull { InputDevice.getDevice(it) }.filter { GamepadMapping.isGamepad(it) }
++        val devices = InputDevice.getDeviceIds().map { InputDevice.getDevice(it) }.filterNotNull().filter { GamepadMapping.isGamepad(it) }
 +        if(devices.isEmpty()) {
 +            content.addView(TextView(this).apply { setText(R.string.gamepad_mapping_no_device) })
 +            return
