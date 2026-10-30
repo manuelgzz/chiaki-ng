@@ -25,6 +25,7 @@ jobs:
       - name: Build libplacebo 7.349.0 for the GUI
         run: |
           git clone --depth 1 --branch v7.349.0 https://code.videolan.org/videolan/libplacebo.git /tmp/libplacebo
+          git -C /tmp/libplacebo submodule update --init --recursive
           meson setup /tmp/libplacebo-build /tmp/libplacebo --prefix=/usr/local -Dvulkan=disabled -Dopengl=enabled -Ddemos=false -Dtests=false
           meson compile -C /tmp/libplacebo-build
           sudo meson install -C /tmp/libplacebo-build
