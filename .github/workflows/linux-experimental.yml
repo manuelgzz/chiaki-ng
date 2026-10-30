@@ -19,9 +19,17 @@ jobs:
             libssl-dev libopus-dev libavcodec-dev libavutil-dev \
             libavformat-dev libswscale-dev libjson-c-dev libcurl4-openssl-dev \
             libudev-dev python3-protobuf protobuf-compiler libprotobuf-dev libprotobuf-c-dev libminiupnpc-dev libevent-dev \
-            libjerasure-dev libnanopb-dev libspeexdsp-dev \
+            libjerasure-dev libnanopb-dev libspeexdsp-dev meson python3-mako \
             qt6-base-dev qt6-declarative-dev qt6-svg-dev qt6-tools-dev \
             libqt6opengl6-dev libsdl2-dev libplacebo-dev libavdevice-dev
+      - name: Build libplacebo 7.349.0 for the GUI
+        run: |
+          git clone --depth 1 --branch v7.349.0 https://code.videolan.org/videolan/libplacebo.git /tmp/libplacebo
+          meson setup /tmp/libplacebo-build /tmp/libplacebo --prefix=/usr/local -Dvulkan=disabled -Dopengl=enabled -Ddemos=false -Dtests=false
+          meson compile -C /tmp/libplacebo-build
+          sudo meson install -C /tmp/libplacebo-build
+          sudo ldconfig
+          pkg-config --modversion libplacebo
       - name: Configure Linux GUI build
         run: |
           cmake -S . -B build-linux -G Ninja \
