@@ -11,6 +11,14 @@ on:
           - original
           - current
 
+      video_pacing:
+        description: 'Cadencia de video: paced prueba la fase 3; immediate conserva la entrega de fase 2'
+        type: choice
+        default: paced
+        options:
+          - paced
+          - immediate
+
 permissions:
   contents: read
 
@@ -30,12 +38,18 @@ jobs:
           git apply android-estabilidad-fase1.patch
           git apply --check android-estabilidad-fase2.patch
           git apply android-estabilidad-fase2.patch
+          git apply --check android-estabilidad-fase3.patch
+          git apply android-estabilidad-fase3.patch
 
       - name: Use original control UI for gamepad comparison
         if: inputs.controls_version == 'original'
         run: |
           git fetch --no-tags --depth=1 origin 14955e5f2c5f6fe9317314a64845bcc555c808a1
           git show FETCH_HEAD:android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt > android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+
+      - name: Select immediate video delivery
+        if: inputs.video_pacing == 'immediate'
+        run: sed -i 's/#define CHIAKI_ANDROID_VIDEO_PACING 1/#define CHIAKI_ANDROID_VIDEO_PACING 0/' android/app/src/main/cpp/video-pacing.h
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -69,7 +83,9 @@ jobs:
           PY
 
       - name: Test native decoder lifecycle and video timing
-        run: bash test/run-android-lifecycle-tests.sh
+        run: |
+          bash test/run-android-lifecycle-tests.sh
+          CC="cc -DCHIAKI_ANDROID_VIDEO_PACING=0" bash test/run-android-lifecycle-tests.sh
 
       - name: Build debug APK
         working-directory: android
@@ -80,7 +96,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: chiaki-android-fase2-arm64-${{ inputs.controls_version }}
+          name: chiaki-android-fase3-arm64-${{ inputs.controls_version }}-${{ inputs.video_pacing }}
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
