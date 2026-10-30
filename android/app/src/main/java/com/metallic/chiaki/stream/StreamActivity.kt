@@ -18,7 +18,6 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.isGone
 import androidx.core.view.isVisible
-import androidx.fragment.app.Fragment
 import androidx.lifecycle.*
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.metallic.chiaki.R
@@ -26,12 +25,13 @@ import com.metallic.chiaki.common.Preferences
 import com.metallic.chiaki.common.ext.viewModelFactory
 import com.metallic.chiaki.databinding.ActivityStreamBinding
 import com.metallic.chiaki.lib.ConnectInfo
+import com.metallic.chiaki.lib.ControllerState
 import com.metallic.chiaki.lib.ConnectVideoProfile
 import com.metallic.chiaki.session.*
 import com.metallic.chiaki.touchcontrols.DefaultTouchControlsFragment
-import com.metallic.chiaki.touchcontrols.TouchControlsFragment
 import com.metallic.chiaki.touchcontrols.TouchpadOnlyFragment
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlin.math.min
@@ -74,6 +74,7 @@ class StreamActivity : AppCompatActivity()
 
 		binding = ActivityStreamBinding.inflate(layoutInflater)
 		setContentView(binding.root)
+		observeTouchControls()
 
 		WindowCompat.setDecorFitsSystemWindows(window, false)
 		insetsController = WindowCompat.getInsetsController(window, window.decorView)
@@ -138,19 +139,31 @@ class StreamActivity : AppCompatActivity()
 
 	private var controlsJob: Job? = null
 
-	override fun onAttachFragment(fragment: Fragment)
+	private fun observeTouchControls()
 	{
-		super.onAttachFragment(fragment)
-		if(fragment is TouchControlsFragment)
-		{
-			controlsJob?.cancel()
-			controlsJob = fragment.controllerState
-				.onEach { viewModel.input.touchControllerState = it }
-				.launchIn(lifecycleScope)
-			fragment.onScreenControlsEnabled = viewModel.onScreenControlsEnabled
-			if(fragment is TouchpadOnlyFragment)
-				fragment.touchpadOnlyEnabled = viewModel.touchpadOnlyEnabled
+		val controls = supportFragmentManager.findFragmentById(R.id.controlsFragment) as DefaultTouchControlsFragment
+		val touchpad = supportFragmentManager.findFragmentById(R.id.touchpadOnlyFragment) as TouchpadOnlyFragment
+		viewModel.onScreenControlsEnabled.observe(this) {
+			controls.requireView().isVisible = it
 		}
+		viewModel.touchpadOnlyEnabled.observe(this) {
+			touchpad.requireView().isVisible = it
+		}
+		// Both fragments exist simultaneously. Only the enabled panel may supply input;
+		// a hidden touchpad must not replace or cancel the full controller's events.
+		controlsJob = combine(
+			controls.controllerState,
+			touchpad.controllerState,
+			viewModel.onScreenControlsEnabled.asFlow(),
+			viewModel.touchpadOnlyEnabled.asFlow()
+		) { controlsState, touchpadState, controlsEnabled, touchpadEnabled ->
+			when {
+				controlsEnabled -> controlsState
+				touchpadEnabled -> touchpadState
+				else -> ControllerState()
+			}
+		}.onEach { viewModel.input.touchControllerState = it }
+			.launchIn(lifecycleScope)
 	}
 
 	override fun onResume()
