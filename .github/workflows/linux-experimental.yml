@@ -47,15 +47,37 @@ jobs:
             -DCHIAKI_ENABLE_PI_DECODER=OFF
       - name: Compile Linux GUI
         run: cmake --build build-linux --parallel 2
-      - name: Package portable Linux bundle
-        if: success()
+      - name: Prepare AppDir
         run: |
-          mkdir -p linux-bundle/bin
-          cp build-linux/gui/chiaki linux-bundle/bin/chiaki
-          tar -czf chiaki-linux-experimental.tar.gz -C linux-bundle .
-      - name: Upload Linux bundle
+          DESTDIR="$PWD/AppDir" cmake --install build-linux --prefix /usr
+          mkdir -p AppDir/usr/lib
+          cp -a /usr/local/lib/x86_64-linux-gnu/libplacebo.so* AppDir/usr/lib/ 2>/dev/null || \
+            cp -a /usr/local/lib/libplacebo.so* AppDir/usr/lib/
+          test -f AppDir/usr/bin/chiaki
+          test -f AppDir/usr/share/applications/chiaking.desktop
+      - name: Build AppImage
+        env:
+          ARCH: x86_64
+          OUTPUT: chiaki-ng-linux-experimental-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          curl -fL --retry 3 -o linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fL --retry 3 -o linuxdeploy-plugin-qt.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy.AppImage linuxdeploy-plugin-qt.AppImage
+          export PATH="$PWD:$PATH"
+          export QML_SOURCES_PATHS="$PWD/gui/src/qml"
+          export LD_LIBRARY_PATH="/usr/local/lib/x86_64-linux-gnu:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          ./linuxdeploy.AppImage --appdir AppDir \
+            --desktop-file AppDir/usr/share/applications/chiaking.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/512x512/apps/chiaking.png \
+            --plugin qt --output appimage
+          test -s "$OUTPUT"
+      - name: Upload AppImage
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: chiaki-linux-experimental
-          path: chiaki-linux-experimental.tar.gz
+          name: chiaki-ng-linux-experimental-AppImage
+          path: chiaki-ng-linux-experimental-x86_64.AppImage
+          if-no-files-found: error
