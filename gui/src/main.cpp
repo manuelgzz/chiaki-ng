@@ -20,7 +20,7 @@ int main(int argc, char *argv[]) { return real_main(argc, argv); }
 #include <discoverymanager.h>
 #include <qmlmainwindow.h>
 #include <QApplication>
-#include <QtTypes>
+#include <QMetaType>
 
 #ifdef CHIAKI_ENABLE_CLI
 #include <chiaki-cli.h>
