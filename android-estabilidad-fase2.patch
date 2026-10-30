@@ -1,0 +1,753 @@
+From 7f1c67efeb7604778ea6f14749457a04cc9a557b Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 30 Oct 2026 08:13:40 -0600
+Subject: [PATCH] Improve Android video delivery and add timing diagnostics and
+ stream controls
+
+---
+ android/app/src/main/cpp/chiaki-jni.c         |   4 +
+ android/app/src/main/cpp/video-decoder.c      | 186 ++++++++++++------
+ android/app/src/main/cpp/video-decoder.h      |  14 +-
+ .../com/metallic/chiaki/common/Preferences.kt |  17 +-
+ .../java/com/metallic/chiaki/lib/Chiaki.kt    |   4 +-
+ .../metallic/chiaki/session/StreamSession.kt  |  17 ++
+ .../chiaki/settings/SettingsFragment.kt       |  25 +++
+ .../metallic/chiaki/stream/StreamViewModel.kt |   5 +-
+ .../main/res/values-es/video_diagnostics.xml  |  11 ++
+ .../src/main/res/values/video_diagnostics.xml |  11 ++
+ android/app/src/main/res/xml/preferences.xml  |  18 ++
+ docs/android-stability-phase2.md              |  40 ++++
+ test/android-stubs/media/NdkMediaCodec.h      |   1 +
+ test/android_decoder_lifecycle.c              |  60 +++++-
+ 14 files changed, 341 insertions(+), 72 deletions(-)
+ create mode 100644 android/app/src/main/res/values-es/video_diagnostics.xml
+ create mode 100644 android/app/src/main/res/values/video_diagnostics.xml
+ create mode 100644 docs/android-stability-phase2.md
+
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index 3d7f95c..c85433e 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -289,6 +289,10 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject
+ 		goto beach;
+ 	}
+ 
++	session->video_decoder.target_fps = connect_info.video_profile.max_fps;
++	session->video_decoder.low_latency = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoLowLatency", "Z"));
++	session->video_decoder.diagnostics = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoDiagnostics", "Z"));
++
+ 	err = android_chiaki_audio_decoder_init(&session->audio_decoder, log);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index b7c07ac..9944608 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -9,6 +9,8 @@
+ #include <android/native_window_jni.h>
+ 
+ #include <string.h>
++#include <inttypes.h>
++#include <chiaki/time.h>
+ 
+ #define INPUT_BUFFER_TIMEOUT_MS 10
+ 
+@@ -21,20 +23,31 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
+ 	decoder->window = NULL;
+ 	decoder->output_thread_started = false;
+ 	decoder->timestamp_cur = 0;
++	decoder->timestamp_origin = 0;
++	decoder->last_input_time = 0;
++	atomic_init(&decoder->input_gap_max_us, 0);
++	decoder->low_latency = false;
++	decoder->diagnostics = true;
++	atomic_init(&decoder->samples_submitted, 0);
++	atomic_init(&decoder->input_timeouts, 0);
++	atomic_init(&decoder->queue_errors, 0);
++	atomic_init(&decoder->oversize_samples, 0);
++	atomic_init(&decoder->input_wait_max_us, 0);
+ 	decoder->target_width = target_width;
+ 	decoder->target_height = target_height;
++	decoder->target_fps = 60;
+ 	decoder->target_codec = codec;
+-	decoder->shutdown_output = false;
++	atomic_init(&decoder->shutdown_output, false);
+ 	return chiaki_mutex_init(&decoder->codec_mutex, false);
+ }
+ 
+ static void kill_decoder(AndroidChiakiVideoDecoder *decoder)
+ {
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+-	decoder->shutdown_output = true;
++	atomic_store(&decoder->shutdown_output, true);
+ 	chiaki_mutex_unlock(&decoder->codec_mutex);
+ 	// The output worker uses finite waits and exits before the codec is freed.
+-	// Never join while holding the mutex the worker needs to observe shutdown.
++	// Join outside the input lock; codec storage stays alive until the join returns.
+ 	if(decoder->output_thread_started)
+ 	{
+ 		chiaki_thread_join(&decoder->output_thread, NULL);
+@@ -71,7 +84,7 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
+ 		return;
+ 	}
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+-	decoder->shutdown_output = false;
++	atomic_store(&decoder->shutdown_output, false);
+ 
+ 	if(decoder->codec)
+ 	{
+@@ -115,6 +128,17 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
+ 	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
++	// A complete compressed access unit must fit in one input buffer.
++	// This is a request; the actual buffer capacity is still checked below.
++	AMediaFormat_setInt32(format, "max-input-size", decoder->target_width * decoder->target_height);
++	if(decoder->low_latency)
++	{
++		// String keys avoid a link dependency on newer NDK symbols. Unsupported
++		// codecs may ignore these hints; successful configure is not proof of support.
++		AMediaFormat_setInt32(format, "low-latency", 1);
++		AMediaFormat_setInt32(format, "priority", 0);
++	}
++	CHIAKI_LOGI(decoder->log, "[android-video] low_latency_requested=%d diagnostics=%d", decoder->low_latency, decoder->diagnostics);
+ 
+ 	media_status_t r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
+ 	if(r != AMEDIA_OK)
+@@ -157,51 +181,74 @@ beach:
+ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
+ {
+ 	bool r = true;
++	uint64_t input_time = chiaki_time_now_monotonic_us();
+ 	AndroidChiakiVideoDecoder *decoder = user;
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+ 
+-	if(!decoder->codec || decoder->shutdown_output)
++	if(!decoder->codec || atomic_load(&decoder->shutdown_output))
+ 	{
+ 		r = false;
+ 		CHIAKI_LOGE(decoder->log, "Received video data, but decoder is not initialized!");
+ 		goto beach;
+ 	}
+ 
+-	while(buf_size > 0)
++	if(!buf || !buf_size)
+ 	{
+-		ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, INPUT_BUFFER_TIMEOUT_MS * 1000);
+-		if(codec_buf_index < 0)
+-		{
+-			CHIAKI_LOGE(decoder->log, "Failed to get input buffer");
+-			r = false;
+-			goto beach;
+-		}
+-
+-		size_t codec_buf_size;
+-		uint8_t *codec_buf = AMediaCodec_getInputBuffer(decoder->codec, (size_t)codec_buf_index, &codec_buf_size);
+-		if(!codec_buf || codec_buf_size == 0)
+-		{
+-			r = false;
+-			goto beach;
+-		}
+-		size_t codec_sample_size = buf_size;
+-		if(codec_sample_size > codec_buf_size)
+-		{
+-			//CHIAKI_LOGD(decoder->log, "Sample is bigger than buffer, splitting");
+-			codec_sample_size = codec_buf_size;
+-		}
+-		memcpy(codec_buf, buf, codec_sample_size);
+-		media_status_t queue_result = AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, codec_sample_size, decoder->timestamp_cur++, 0); // timestamp just raised by 1 for maximum realtime
+-		if(queue_result != AMEDIA_OK)
+-		{
+-			CHIAKI_LOGE(decoder->log, "AMediaCodec_queueInputBuffer() failed: %d", (int)queue_result);
+-			r = false;
+-			goto beach;
+-		}
+-		buf += codec_sample_size;
+-		buf_size -= codec_sample_size;
+-
++		r = false;
++		goto beach;
++	}
++	if(decoder->last_input_time)
++	{
++		uint64_t gap = input_time - decoder->last_input_time;
++		uint_fast64_t old_gap = atomic_load(&decoder->input_gap_max_us);
++		while(gap > old_gap && !atomic_compare_exchange_weak(&decoder->input_gap_max_us, &old_gap, gap)) {}
++	}
++	decoder->last_input_time = input_time;
++	uint64_t wait_start = chiaki_time_now_monotonic_us();
++	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, INPUT_BUFFER_TIMEOUT_MS * 1000);
++	uint64_t wait_us = chiaki_time_now_monotonic_us() - wait_start;
++	// The input callback is serialized by codec_mutex, so it is the only writer
++	// of this maximum except for the output worker's periodic atomic exchange.
++	uint_fast64_t old_max = atomic_load(&decoder->input_wait_max_us);
++	while(wait_us > old_max && !atomic_compare_exchange_weak(&decoder->input_wait_max_us, &old_max, wait_us)) {}
++	if(codec_buf_index < 0)
++	{
++		if(codec_buf_index == -1) // AMEDIACODEC_INFO_TRY_AGAIN_LATER
++			atomic_fetch_add(&decoder->input_timeouts, 1);
++		else
++			atomic_fetch_add(&decoder->queue_errors, 1);
++		r = false;
++		goto beach;
++	}
++	size_t codec_buf_size = 0;
++	uint8_t *codec_buf = AMediaCodec_getInputBuffer(decoder->codec, (size_t)codec_buf_index, &codec_buf_size);
++	if(!codec_buf || buf_size > codec_buf_size)
++	{
++		// Return ownership of the acquired slot. Never split an access unit into
++		// independent frames: that can corrupt decoding and trigger visible recovery.
++		if(AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, 0, decoder->timestamp_cur, 0) != AMEDIA_OK)
++			atomic_fetch_add(&decoder->queue_errors, 1);
++		atomic_fetch_add(&decoder->oversize_samples, 1);
++		r = false;
++		goto beach;
+ 	}
++	uint64_t now = chiaki_time_now_monotonic_us();
++	if(!decoder->timestamp_origin)
++		decoder->timestamp_origin = now;
++	uint64_t timestamp = now - decoder->timestamp_origin;
++	if(timestamp <= decoder->timestamp_cur)
++		timestamp = decoder->timestamp_cur + 1;
++	memcpy(codec_buf, buf, buf_size);
++	media_status_t queue_result = AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, buf_size, timestamp, 0);
++	if(queue_result != AMEDIA_OK)
++	{
++		atomic_fetch_add(&decoder->queue_errors, 1);
++		CHIAKI_LOGE(decoder->log, "AMediaCodec_queueInputBuffer() failed: %d", (int)queue_result);
++		r = false;
++		goto beach;
++	}
++	decoder->timestamp_cur = timestamp;
++	atomic_fetch_add(&decoder->samples_submitted, 1);
+ 
+ beach:
+ 	chiaki_mutex_unlock(&decoder->codec_mutex);
+@@ -211,39 +258,56 @@ beach:
+ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ {
+ 	AndroidChiakiVideoDecoder *decoder = user;
+-
+-	while(1)
++	uint64_t report_start = chiaki_time_now_monotonic_us();
++	uint64_t last_output = 0, output_count = 0, max_gap = 0, long_gaps = 0;
++	uint64_t release_errors = 0;
++	uint64_t gap_threshold_us = 1500000 / (decoder->target_fps ? decoder->target_fps : 60);
++	while(!atomic_load(&decoder->shutdown_output))
+ 	{
+-		chiaki_mutex_lock(&decoder->codec_mutex);
+-		bool stopping = decoder->shutdown_output;
+-		chiaki_mutex_unlock(&decoder->codec_mutex);
+-		if(stopping)
+-			break;
++		// Do not acquire codec_mutex here: input may be waiting for a free buffer.
++		// Shutdown joins this worker before stopping or deleting the codec.
+ 		AMediaCodecBufferInfo info;
+ 		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 10000);
+ 		if(status >= 0)
+ 		{
+-			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
+-			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
++			bool render = info.size != 0 && !(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG);
++			media_status_t result = AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);
++			if(result != AMEDIA_OK)
++				release_errors++;
++			if(render && result == AMEDIA_OK)
+ 			{
+-				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");
+-				break;
++				uint64_t now = chiaki_time_now_monotonic_us();
++				if(last_output)
++				{
++					uint64_t gap = now - last_output;
++					if(gap > max_gap) max_gap = gap;
++					if(gap > gap_threshold_us) long_gaps++;
++				}
++				last_output = now;
++				output_count++;
+ 			}
++			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
++				break;
+ 		}
+-		else
++		uint64_t now = chiaki_time_now_monotonic_us();
++		if(decoder->diagnostics && now - report_start >= 5000000)
+ 		{
+-			chiaki_mutex_lock(&decoder->codec_mutex);
+-			bool shutdown = decoder->shutdown_output;
+-			chiaki_mutex_unlock(&decoder->codec_mutex);
+-			if(shutdown)
+-			{
+-				CHIAKI_LOGI(decoder->log, "Video Decoder Output Thread detected shutdown after reported error");
+-				break;
+-			}
++			CHIAKI_LOGI(decoder->log, "[android-video] window_ms=%" PRIu64 " output=%" PRIu64
++				" max_output_gap_us=%" PRIu64 " gaps_over_threshold=%" PRIu64 " gap_threshold_us=%" PRIu64
++				" submitted=%" PRIuFAST64 " input_timeouts=%" PRIuFAST64
++				" queue_errors=%" PRIuFAST64 " invalid_or_oversize=%" PRIuFAST64
++				" max_input_wait_us=%" PRIuFAST64 " max_input_gap_us=%" PRIuFAST64 " release_errors=%" PRIu64,
++				(now - report_start) / 1000, output_count, max_gap, long_gaps, gap_threshold_us,
++				atomic_exchange(&decoder->samples_submitted, 0),
++				atomic_exchange(&decoder->input_timeouts, 0),
++				atomic_exchange(&decoder->queue_errors, 0),
++				atomic_exchange(&decoder->oversize_samples, 0),
++				atomic_exchange(&decoder->input_wait_max_us, 0),
++				atomic_exchange(&decoder->input_gap_max_us, 0), release_errors);
++			report_start = now;
++			output_count = max_gap = long_gaps = release_errors = 0;
+ 		}
+ 	}
+-
+ 	CHIAKI_LOGI(decoder->log, "Video Decoder Output Thread exiting");
+-
+ 	return NULL;
+-}
+\ No newline at end of file
++}
+diff --git a/android/app/src/main/cpp/video-decoder.h b/android/app/src/main/cpp/video-decoder.h
+index dfaee21..47eba02 100644
+--- a/android/app/src/main/cpp/video-decoder.h
++++ b/android/app/src/main/cpp/video-decoder.h
+@@ -4,6 +4,7 @@
+ #define CHIAKI_JNI_VIDEO_DECODER_H
+ 
+ #include <jni.h>
++#include <stdatomic.h>
+ 
+ #include <chiaki/thread.h>
+ #include <chiaki/log.h>
+@@ -18,11 +19,22 @@ typedef struct android_chiaki_video_decoder_t
+ 	AMediaCodec *codec;
+ 	ANativeWindow *window;
+ 	uint64_t timestamp_cur;
++	uint64_t timestamp_origin;
++	uint64_t last_input_time;
++	atomic_uint_fast64_t input_gap_max_us;
++	bool low_latency;
++	bool diagnostics;
++	atomic_uint_fast64_t samples_submitted;
++	atomic_uint_fast64_t input_timeouts;
++	atomic_uint_fast64_t queue_errors;
++	atomic_uint_fast64_t oversize_samples;
++	atomic_uint_fast64_t input_wait_max_us;
+ 	ChiakiThread output_thread;
+-	bool shutdown_output;
++	atomic_bool shutdown_output;
+ 	bool output_thread_started;
+ 	int32_t target_width;
+ 	int32_t target_height;
++	unsigned int target_fps;
+ 	ChiakiCodec target_codec;
+ } AndroidChiakiVideoDecoder;
+ 
+diff --git a/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt b/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
+index e1d57ad..a81ce05 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
+@@ -53,12 +53,27 @@ class Preferences(context: Context)
+ 	private val sharedPreferenceChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+ 		when(key)
+ 		{
+-			resolutionKey -> _bitrateAutoFlow.value = bitrateAuto
++			resolutionKey, fpsKey -> _bitrateAutoFlow.value = bitrateAuto
+ 		}
+ 	}.also { sharedPreferences.registerOnSharedPreferenceChangeListener(it) }
+ 
+ 	private val resources = context.resources
+ 
++	val videoLowLatencyKey = "video_low_latency"
++	var videoLowLatency: Boolean
++		get() = sharedPreferences.getBoolean(videoLowLatencyKey, false)
++		set(value) { sharedPreferences.edit().putBoolean(videoLowLatencyKey, value).apply() }
++
++	val videoDiagnosticsKey = "video_diagnostics"
++	var videoDiagnostics: Boolean
++		get() = sharedPreferences.getBoolean(videoDiagnosticsKey, true)
++		set(value) { sharedPreferences.edit().putBoolean(videoDiagnosticsKey, value).apply() }
++
++	val videoMatchRefreshKey = "video_match_refresh"
++	var videoMatchRefresh: Boolean
++		get() = sharedPreferences.getBoolean(videoMatchRefreshKey, false)
++		set(value) { sharedPreferences.edit().putBoolean(videoMatchRefreshKey, value).apply() }
++
+ 	val discoveryEnabledKey get() = resources.getString(R.string.preferences_discovery_enabled_key)
+ 	var discoveryEnabled
+ 		get() = sharedPreferences.getBoolean(discoveryEnabledKey, true)
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index bb0b0a6..466489e 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -69,7 +69,9 @@ data class ConnectInfo(
+ 	val host: String,
+ 	val registKey: ByteArray,
+ 	val morning: ByteArray,
+-	val videoProfile: ConnectVideoProfile
++	val videoProfile: ConnectVideoProfile,
++	val videoLowLatency: Boolean = false,
++	val videoDiagnostics: Boolean = true
+ ): Parcelable
+ 
+ private class ChiakiNative
+diff --git a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+index dd32a40..60632eb 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+@@ -3,6 +3,7 @@
+ package com.metallic.chiaki.session
+ 
+ import android.graphics.SurfaceTexture
++import android.os.Build
+ import android.util.Log
+ import android.view.*
+ import androidx.lifecycle.LiveData
+@@ -93,6 +94,21 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
+ 		}
+ 	}
+ 
++	private fun requestVideoFrameRate(surface: Surface)
++	{
++		if(Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !input.preferences.videoMatchRefresh)
++			return
++		try {
++			// A hint to Android, not a forced display mode or an extra frame queue.
++			surface.setFrameRate(connectInfo.videoProfile.maxFPS.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
++			Log.i("StreamSession", "Requested video surface rate: ${connectInfo.videoProfile.maxFPS} fps")
++		} catch(e: IllegalArgumentException) {
++			Log.w("StreamSession", "Display rejected video frame rate hint", e)
++		} catch(e: IllegalStateException) {
++			Log.w("StreamSession", "Surface unavailable for frame rate hint", e)
++		}
++	}
++
+ 	fun attachToSurfaceView(surfaceView: SurfaceView)
+ 	{
+ 		surfaceView.holder.addCallback(object: SurfaceHolder.Callback {
+@@ -102,6 +118,7 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
+ 			{
+ 				val surface = holder.surface
+ 				this@StreamSession.surface = surface
++				requestVideoFrameRate(surface)
+ 				session?.setSurface(surface)
+ 			}
+ 
+diff --git a/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt b/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
+index f2aa77c..0e97deb 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
+@@ -6,11 +6,13 @@ import android.app.Activity
+ import android.content.Intent
+ import android.content.res.Resources
+ import android.os.Bundle
++import android.os.Build
+ import android.text.InputType
+ import androidx.lifecycle.Observer
+ import androidx.lifecycle.ViewModelProvider
+ import androidx.lifecycle.lifecycleScope
+ import androidx.preference.*
++import com.google.android.material.dialog.MaterialAlertDialogBuilder
+ import com.metallic.chiaki.R
+ import com.metallic.chiaki.common.Preferences
+ import com.metallic.chiaki.common.exportAndShareAllSettings
+@@ -22,6 +24,9 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ {
+ 	override fun getBoolean(key: String?, defValue: Boolean) = when(key)
+ 	{
++		preferences.videoLowLatencyKey -> preferences.videoLowLatency
++		preferences.videoDiagnosticsKey -> preferences.videoDiagnostics
++		preferences.videoMatchRefreshKey -> preferences.videoMatchRefresh
+ 		preferences.logVerboseKey -> preferences.logVerbose
+ 		preferences.swapCrossMoonKey -> preferences.swapCrossMoon
+ 		preferences.rumbleEnabledKey -> preferences.rumbleEnabled
+@@ -34,6 +39,9 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ 	{
+ 		when(key)
+ 		{
++			preferences.videoLowLatencyKey -> preferences.videoLowLatency = value
++			preferences.videoDiagnosticsKey -> preferences.videoDiagnostics = value
++			preferences.videoMatchRefreshKey -> preferences.videoMatchRefresh = value
+ 			preferences.logVerboseKey -> preferences.logVerbose = value
+ 			preferences.swapCrossMoonKey -> preferences.swapCrossMoon = value
+ 			preferences.rumbleEnabledKey -> preferences.rumbleEnabled = value
+@@ -92,6 +100,9 @@ class SettingsFragment: PreferenceFragmentCompat(), TitleFragment
+ 		val preferences = viewModel.preferences
+ 		preferenceManager.preferenceDataStore = DataStore(preferences)
+ 		setPreferencesFromResource(R.xml.preferences, rootKey)
++		listOf(preferences.videoLowLatencyKey, preferences.videoMatchRefreshKey).forEach { key ->
++			preferenceScreen.findPreference<SwitchPreference>(key)?.isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
++		}
+ 
+ 		preferenceScreen.findPreference<ListPreference>(getString(R.string.preferences_resolution_key))?.let {
+ 			it.entryValues = Preferences.resolutionAll.map { res -> res.value }.toTypedArray()
+@@ -115,6 +126,20 @@ class SettingsFragment: PreferenceFragmentCompat(), TitleFragment
+ 				editText.setText(preferences.bitrate?.toString() ?: "")
+ 			}
+ 		}
++		preferenceScreen.findPreference<Preference>("bitrate_presets")?.setOnPreferenceClickListener {
++			val rates = listOf<Int?>(null, 5000, 8000, 10000, 15000, 20000)
++			val labels = rates.map { rate ->
++				if(rate == null) getString(R.string.preferences_bitrate_auto, preferences.bitrateAuto)
++				else "$rate kbps"
++			}.toTypedArray()
++			MaterialAlertDialogBuilder(context)
++				.setTitle(R.string.video_bitrate_presets_title)
++				.setItems(labels) { _, index ->
++					bitratePreference?.text = rates[index]?.toString() ?: ""
++				}
++				.show()
++			true
++		}
+ 		viewModel.bitrateAuto.observe(this, Observer {
+ 			bitratePreference?.summaryProvider = bitrateSummaryProvider
+ 		})
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+index 23eced1..e0d439c 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+@@ -17,7 +17,10 @@ class StreamViewModel(val application: Application, val connectInfo: ConnectInfo
+ 	val logManager = LogManager(application)
+ 
+ 	val input = StreamInput(application, preferences)
+-	val session = StreamSession(connectInfo, logManager, preferences.logVerbose, input)
++	val session = StreamSession(connectInfo.copy(
++		videoLowLatency = preferences.videoLowLatency,
++		videoDiagnostics = preferences.videoDiagnostics
++	), logManager, preferences.logVerbose, input)
+ 
+ 	private var _onScreenControlsEnabled = MutableLiveData<Boolean>(preferences.onScreenControlsEnabled)
+ 	val onScreenControlsEnabled: LiveData<Boolean> get() = _onScreenControlsEnabled
+diff --git a/android/app/src/main/res/values-es/video_diagnostics.xml b/android/app/src/main/res/values-es/video_diagnostics.xml
+new file mode 100644
+index 0000000..044322a
+--- /dev/null
++++ b/android/app/src/main/res/values-es/video_diagnostics.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="video_low_latency_title">Decodificador de baja latencia</string>
++    <string name="video_low_latency_summary">Solicita decodificación de baja latencia si el dispositivo la admite. Reconecta para aplicar; desactiva si empeora el video.</string>
++    <string name="video_match_refresh_title">Ajustar pantalla al video</string>
++    <string name="video_match_refresh_summary">Solicita a Android 11 o posterior una frecuencia de pantalla compatible con la transmisión. El sistema puede ignorarla. Reconecta para aplicar.</string>
++    <string name="video_diagnostics_title">Diagnóstico de tiempos de video</string>
++    <string name="video_diagnostics_summary">Guarda un resumen cada 5 segundos en el registro: esperas, intervalos de salida y errores del decodificador. No mide FPS de pantalla ni latencia de red.</string>
++    <string name="video_bitrate_presets_title">Selección rápida de bitrate</string>
++    <string name="video_bitrate_presets_summary">Automático o 5, 8, 10, 15, 20 Mbps. Usa Bitrate para un valor en kbps; déjalo vacío para usar el preajuste de resolución. Reconecta para aplicar.</string>
++</resources>
+diff --git a/android/app/src/main/res/values/video_diagnostics.xml b/android/app/src/main/res/values/video_diagnostics.xml
+new file mode 100644
+index 0000000..6e97478
+--- /dev/null
++++ b/android/app/src/main/res/values/video_diagnostics.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="video_low_latency_title">Low latency video decoder</string>
++    <string name="video_low_latency_summary">Request low latency decoding where supported. Reconnect to apply; disable if playback worsens.</string>
++    <string name="video_match_refresh_title">Match display to video</string>
++    <string name="video_match_refresh_summary">Ask Android 11 or newer for a display refresh rate compatible with the stream. The system may ignore this request. Reconnect to apply.</string>
++    <string name="video_diagnostics_title">Video timing diagnostics</string>
++    <string name="video_diagnostics_summary">Write a summary every 5 seconds to the session log: decoder waits, output gaps and errors. These are decoder measurements, not display FPS or network latency.</string>
++    <string name="video_bitrate_presets_title">Quick bitrate selection</string>
++    <string name="video_bitrate_presets_summary">Auto or 5, 8, 10, 15, 20 Mbps. Use Bitrate for a custom value in kbps; leave it blank for the resolution preset. Reconnect to apply.</string>
++</resources>
+diff --git a/android/app/src/main/res/xml/preferences.xml b/android/app/src/main/res/xml/preferences.xml
+index 49989db..4169bb9 100644
+--- a/android/app/src/main/res/xml/preferences.xml
++++ b/android/app/src/main/res/xml/preferences.xml
+@@ -71,11 +71,29 @@
+             app:title="@string/preferences_bitrate_title"
+             app:icon="@drawable/ic_bitrate"/>
+ 
++        <Preference
++            app:key="bitrate_presets"
++            app:title="@string/video_bitrate_presets_title"
++            app:summary="@string/video_bitrate_presets_summary" />
++
+         <ListPreference
+             app:key="@string/preferences_codec_key"
+             app:title="@string/preferences_codec_title"
+             app:summary="%s"
+             app:icon="@drawable/ic_codec"/>
++
++        <SwitchPreference
++            app:key="video_low_latency"
++            app:title="@string/video_low_latency_title"
++            app:summary="@string/video_low_latency_summary" />
++        <SwitchPreference
++            app:key="video_match_refresh"
++            app:title="@string/video_match_refresh_title"
++            app:summary="@string/video_match_refresh_summary" />
++        <SwitchPreference
++            app:key="video_diagnostics"
++            app:title="@string/video_diagnostics_title"
++            app:summary="@string/video_diagnostics_summary" />
+     </PreferenceCategory>
+ 
+     <PreferenceCategory
+diff --git a/docs/android-stability-phase2.md b/docs/android-stability-phase2.md
+new file mode 100644
+index 0000000..a30245b
+--- /dev/null
++++ b/docs/android-stability-phase2.md
+@@ -0,0 +1,40 @@
++# Android: tiempos de video y opciones de transmisión
++
++Esta fase se aplica después de android-estabilidad-fase1.patch. No requiere ni modifica el arreglo del control táctil. No modifica el protocolo de conexión, el registro ni el audio.
++
++## Cambios
++
++- El hilo de salida consulta una bandera atómica de apagado sin tomar codec_mutex. Ya no espera ese mutex mientras la entrada espera un búfer. Stop/delete siguen ocurriendo después del join.
++- Marcas de tiempo monotónicas relativas al envío local, en microsegundos reales, en vez de sumar 1 por fragmento. No son timestamps originales de la consola y no implementan sincronización con vblank.
++- Una muestra comprimida se entrega completa por búfer. Se solicita max-input-size y se rechazan muestras que no caben; el slot adquirido se devuelve vacío. Un rechazo informa fallo al receptor. No se introduce una cola de video adicional.
++- Diagnóstico agregado cada 5 segundos. No se registra cada cuadro.
++- Baja latencia opcional: solicita low-latency=1 y prioridad de tiempo real al MediaCodec. Desactivada por defecto. Un controlador puede ignorar o rechazar la petición.
++- Frecuencia de pantalla opcional: Surface.setFrameRate con la cadencia de la transmisión, Android 11 o posterior. Desactivada por defecto; es una sugerencia al sistema, no garantiza cambiar los Hz.
++- Selección rápida de bitrate: automático, 5, 8, 10, 15 o 20 Mbps, conservando el campo manual de 2000 a 50000 kbps. Automático es el preajuste calculado, no un algoritmo nuevo de bitrate adaptativo. La cifra automática se actualiza al cambiar resolución o FPS.
++- Textos de las opciones nuevas en español e inglés. Las opciones se aplican al reconectar.
++
++## Lectura del diagnóstico
++
++Busca `[android-video] window_ms=` en Ajustes > Registros y comparte el registro completo de una prueba de al menos 60 segundos.
++
++- output: búferes de imagen entregados a la superficie; no son cuadros comprobados en pantalla.
++- max_output_gap_us: mayor intervalo entre entregas. Incluye planificación del hilo y tiempo de release; por sí solo no identifica la causa.
++- gaps_over_threshold: intervalos mayores a 1,5 períodos del perfil configurado. A 60 FPS, el umbral es 25000 us; a 30, 50000 us. No equivale a cuadros perdidos.
++- submitted: muestras enviadas al códec; pueden incluir cabeceras, por lo que no equivale a FPS.
++- input_timeouts: entradas no disponibles al acabar la espera de hasta 10 ms.
++- queue_errors / release_errors: errores de entrada o entrega.
++- invalid_or_oversize: muestras rechazadas por capacidad o búfer de entrada inválido.
++- max_input_wait_us: mayor espera local de entrada dentro de la ventana.
++- max_input_gap_us: mayor intervalo entre llamadas de entrega de muestras. Incluye recepción/reconstrucción y trabajo previo de la llamada anterior; no es una medida directa del jitter de red.
++
++Los contadores se reinician por ventana. No miden latencia de red, pérdidas UDP ni latencia de extremo a extremo.
++
++## Comparación en Legion Y700
++
++Mantén 720p, 60 FPS, H.265 y el mismo bitrate y gamepad. Primero prueba con diagnóstico activado, baja latencia desactivada y ajuste de pantalla desactivado. Después activa solo ajuste de pantalla y reconecta. Finalmente prueba baja latencia como cambio separado. Usa la misma escena y movimiento lento de cámara, 2 minutos por variante. Desactiva la opción que empeore el video.
++
++El workflow permite controls_version=original para conservar la interfaz del primer APK al probar con gamepad, o current para usar la de main. Esta selección no demuestra ni corrige la causa del fallo de conexión del segundo APK.
++
++## Límites de esta fase
++
++No se ha identificado aún la causa de los microcongelamientos en el dispositivo. Los cambios eliminan una espera concreta, corrigen la entrega de muestras y facilitan medir el resto. No se implementa todavía una cola de recepción independiente, recuperación completa de MediaCodec, jitter buffer o cambios de audio/IDR.
+diff --git a/test/android-stubs/media/NdkMediaCodec.h b/test/android-stubs/media/NdkMediaCodec.h
+index 3669c84..e1087a8 100644
+--- a/test/android-stubs/media/NdkMediaCodec.h
++++ b/test/android-stubs/media/NdkMediaCodec.h
+@@ -9,6 +9,7 @@ typedef struct ANativeWindow ANativeWindow;
+ typedef struct { int32_t offset,size; int64_t presentationTimeUs; uint32_t flags; } AMediaCodecBufferInfo;
+ #define AMEDIA_OK 0
+ #define AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM 4
++#define AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG 2
+ AMediaCodec *AMediaCodec_createDecoderByType(const char *);
+ media_status_t AMediaCodec_configure(AMediaCodec *, const AMediaFormat *, ANativeWindow *, void *, uint32_t);
+ media_status_t AMediaCodec_start(AMediaCodec *);
+diff --git a/test/android_decoder_lifecycle.c b/test/android_decoder_lifecycle.c
+index f047ab3..3c23c1c 100644
+--- a/test/android_decoder_lifecycle.c
++++ b/test/android_decoder_lifecycle.c
+@@ -12,11 +12,32 @@
+ struct AMediaCodec { atomic_int readers; uint8_t data[256]; };
+ struct ANativeWindow { int unused; };
+ static int windows, codecs;
++static atomic_int output_polls;
++static atomic_int pending_outputs;
++static atomic_int rendered_outputs;
++static atomic_int timing_reports;
++static void capture_log(ChiakiLogLevel level, const char *msg, void *user) {
++ (void)level;(void)user;
++ if(strstr(msg,"[android-video] window_ms=")) {
++  assert(strstr(msg,"max_input_wait_us=") && strstr(msg,"gap_threshold_us=25000"));
++  atomic_fetch_add(&timing_reports,1);
++ }
++}
++static int simulate_input_wait;
++static int low_latency_hint, priority_hint, requested_input_size;
++static uint64_t last_timestamp;
++static size_t queued_size;
++static int queue_calls;
+ static int fail_input, fail_queue, fail_swap, fail_configure, fail_start;
+ AMediaFormat *AMediaFormat_new(void) { return calloc(1,sizeof(AMediaFormat)); }
+ void AMediaFormat_delete(AMediaFormat *f) { free(f); }
+ void AMediaFormat_setString(AMediaFormat *f,const char *k,const char *v) { (void)f;(void)k;(void)v; }
+-void AMediaFormat_setInt32(AMediaFormat *f,const char *k,int32_t v) { (void)f;(void)k;(void)v; }
++void AMediaFormat_setInt32(AMediaFormat *f,const char *k,int32_t v) {
++ (void)f;
++ if(!strcmp(k,"low-latency")) low_latency_hint=v;
++ if(!strcmp(k,"priority")) priority_hint=v+1;
++ if(!strcmp(k,"max-input-size")) requested_input_size=v;
++}
+ ANativeWindow *ANativeWindow_fromSurface(JNIEnv *e,jobject s) { (void)e;(void)s;windows++;return calloc(1,sizeof(ANativeWindow)); }
+ void ANativeWindow_release(ANativeWindow *w) { assert(w);windows--;free(w); }
+ AMediaCodec *AMediaCodec_createDecoderByType(const char *m) { (void)m;codecs++;return calloc(1,sizeof(AMediaCodec)); }
+@@ -25,30 +46,55 @@ media_status_t AMediaCodec_start(AMediaCodec *c) { (void)c;return fail_start ? -
+ media_status_t AMediaCodec_stop(AMediaCodec *c) { assert(!atomic_load(&c->readers));return 0; }
+ media_status_t AMediaCodec_delete(AMediaCodec *c) { assert(!atomic_load(&c->readers));codecs--;free(c);return 0; }
+ media_status_t AMediaCodec_setOutputSurface(AMediaCodec *c,ANativeWindow *w) { (void)c;(void)w;return fail_swap ? -1:0; }
+-ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec *c,int64_t t) { (void)c;(void)t;return fail_input ? -1:0; }
++ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec *c,int64_t t) { (void)c;assert(t==10000);
++ if(simulate_input_wait) {
++  int before=atomic_load(&output_polls);usleep(20000);
++  assert(atomic_load(&output_polls)>before); // output must not wait for the input lock
++ }
++ return fail_input ? -1:0; }
+ uint8_t *AMediaCodec_getInputBuffer(AMediaCodec *c,size_t i,size_t *s) { (void)i;*s=sizeof(c->data);return c->data; }
+ uint8_t *AMediaCodec_getOutputBuffer(AMediaCodec *c,size_t i,size_t *s) { return AMediaCodec_getInputBuffer(c,i,s); }
+-media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *c,size_t i,off_t o,size_t s,uint64_t t,uint32_t f) { (void)c;(void)i;(void)o;(void)s;(void)t;(void)f;return fail_queue ? -1:0; }
+-ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c,AMediaCodecBufferInfo *i,int64_t t) { (void)i;assert(t>=0);atomic_fetch_add(&c->readers,1);usleep(1000);atomic_fetch_sub(&c->readers,1);return -1; }
+-media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *c,size_t i,_Bool r) { (void)c;(void)i;(void)r;return 0; }
++media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *c,size_t i,off_t o,size_t s,uint64_t t,uint32_t f) { (void)c;(void)i;(void)o;(void)f;queued_size=s;last_timestamp=t;queue_calls++;if(!fail_queue && s) atomic_fetch_add(&pending_outputs,1);return fail_queue ? -1:0; }
++ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c,AMediaCodecBufferInfo *i,int64_t t) { (void)i;assert(t>=0);atomic_fetch_add(&output_polls,1);atomic_fetch_add(&c->readers,1);usleep(1000);atomic_fetch_sub(&c->readers,1);
++ int pending=atomic_load(&pending_outputs);
++ if(pending>0 && atomic_compare_exchange_strong(&pending_outputs,&pending,pending-1)) {
++  memset(i,0,sizeof(*i));i->size=4;return 0;
++ }
++ return -1; }
++media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *c,size_t i,_Bool r) { (void)c;(void)i;if(r)atomic_fetch_add(&rendered_outputs,1);return 0; }
+ static void *check_unlocked(void *arg) { ChiakiMutex *m=arg;assert(chiaki_mutex_trylock(m)==CHIAKI_ERR_SUCCESS);chiaki_mutex_unlock(m);return NULL; }
+ static void unlocked(ChiakiMutex *m) { ChiakiThread t;assert(chiaki_thread_create(&t,check_unlocked,m)==CHIAKI_ERR_SUCCESS);chiaki_thread_join(&t,NULL); }
+ int main(void)
+ {
+- ChiakiLog log;chiaki_log_init(&log,0,NULL,NULL);
++ ChiakiLog log;chiaki_log_init(&log,CHIAKI_LOG_ALL,capture_log,NULL);
+  AndroidChiakiVideoDecoder v;
+  assert(android_chiaki_video_decoder_init(&v,&log,1280,720,CHIAKI_CODEC_H264)==CHIAKI_ERR_SUCCESS);
+  uint8_t sample[4]={0};
+  assert(!android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));
+  android_chiaki_video_decoder_set_surface(&v,NULL,NULL);unlocked(&v.codec_mutex);
++ v.low_latency=true;
+  for(int n=0;n<30;n++) {
+   android_chiaki_video_decoder_set_surface(&v,NULL,(jobject)1);
+   usleep(2000);
+   assert(android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));
++  assert(low_latency_hint==1 && priority_hint==1 && requested_input_size==1280*720);
++  uint64_t previous_timestamp=last_timestamp;usleep(2000);
++  simulate_input_wait=1;
++  assert(android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));
++  simulate_input_wait=0;
++  assert(last_timestamp>=previous_timestamp+2000 && queued_size==sizeof(sample));
++  uint8_t oversized[512]={0};int previous_calls=queue_calls;
++  uint64_t previous_oversize=atomic_load(&v.oversize_samples);
++  assert(!android_chiaki_video_decoder_video_sample(oversized,sizeof(oversized),0,false,&v));
++  assert(queue_calls==previous_calls+1 && queued_size==0);
++  assert(atomic_load(&v.oversize_samples)==previous_oversize+1);
++
+   fail_input=1;assert(!android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));fail_input=0;
+   fail_queue=1;assert(!android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));fail_queue=0;
+   ANativeWindow *old=v.window;fail_swap=1;
+   android_chiaki_video_decoder_set_surface(&v,NULL,(jobject)1);assert(v.window==old && windows==1);fail_swap=0;
++  if(n==0) { usleep(5100000);assert(atomic_load(&timing_reports)==1); }
++  usleep(5000);assert(atomic_load(&rendered_outputs)>0);
+   android_chiaki_video_decoder_set_surface(&v,NULL,NULL);unlocked(&v.codec_mutex);
+   assert(!v.codec && !v.window && !v.output_thread_started);assert(codecs==0 && windows==0);
+  }
+@@ -74,6 +120,6 @@ int main(void)
+   unlocked(&a.codec_mutex);android_chiaki_audio_decoder_fini(&a);
+   fail_configure=fail_start=0;assert(codecs==0);
+  }
+- puts("PASS: 30 video cycles, 30 audio reconfiguration cycles, input/queue/surface/configure/start errors, cross-thread unlock and resource balance");
++ puts("PASS: output progresses during input wait, real-time PTS, oversize rejection, low-latency hints, periodic diagnostic report;  30 video cycles, 30 audio reconfiguration cycles, input/queue/surface/configure/start errors, cross-thread unlock and resource balance");
+  return 0;
+ }
+-- 
+2.51.1
+
