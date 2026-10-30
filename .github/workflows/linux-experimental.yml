@@ -19,11 +19,13 @@ jobs:
             libssl-dev libopus-dev libavcodec-dev libavutil-dev \
             libavformat-dev libswscale-dev libjson-c-dev libcurl4-openssl-dev \
             libudev-dev python3-protobuf protobuf-compiler libprotobuf-dev libprotobuf-c-dev libminiupnpc-dev libevent-dev \
-            libjerasure-dev libnanopb-dev libspeexdsp-dev
-      - name: Configure core decoder build
+            libjerasure-dev libnanopb-dev libspeexdsp-dev \
+            qt6-base-dev qt6-declarative-dev qt6-svg-dev qt6-tools-dev \
+            libqt6opengl6-dev libsdl2-dev libplacebo-dev libavdevice-dev
+      - name: Configure Linux GUI build
         run: |
           cmake -S . -B build-linux -G Ninja \
-            -DCHIAKI_ENABLE_GUI=OFF \
+            -DCHIAKI_ENABLE_GUI=ON \
             -DCHIAKI_ENABLE_BOREALIS=OFF \
             -DCHIAKI_ENABLE_TESTS=OFF \
             -DCHIAKI_ENABLE_CLI=OFF \
@@ -34,5 +36,17 @@ jobs:
             -DCHIAKI_ENABLE_RUDP=OFF \
             -DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF \
             -DCHIAKI_ENABLE_PI_DECODER=OFF
-      - name: Compile
+      - name: Compile Linux GUI
         run: cmake --build build-linux --parallel 2
+      - name: Package portable Linux bundle
+        if: success()
+        run: |
+          mkdir -p linux-bundle/bin
+          cp build-linux/gui/chiaki linux-bundle/bin/chiaki
+          tar -czf chiaki-linux-experimental.tar.gz -C linux-bundle .
+      - name: Upload Linux bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiaki-linux-experimental
+          path: chiaki-linux-experimental.tar.gz
