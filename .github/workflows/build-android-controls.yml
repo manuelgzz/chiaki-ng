@@ -1,0 +1,91 @@
+name: Build Android Touch and Gamepad APK
+
+on:
+  push:
+    branches: [android-controls-gamepad]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Apply Android stability fixes
+        run: |
+          git apply --check android-estabilidad-fase1.patch
+          git apply android-estabilidad-fase1.patch
+          git apply --check android-estabilidad-fase2.patch
+          git apply android-estabilidad-fase2.patch
+          git apply --check android-estabilidad-fase3.patch
+          git apply android-estabilidad-fase3.patch
+          git apply --check android-estabilidad-fase4.patch
+          git apply android-estabilidad-fase4.patch
+
+      - name: Apply touch and gamepad controls
+        run: |
+          git apply --check android-controles-gamepad.patch
+          git apply android-controles-gamepad.patch
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build pkg-config protobuf-compiler python3-venv perl
+          python3 -m venv "$RUNNER_TEMP/chiaki-python"
+          "$RUNNER_TEMP/chiaki-python/bin/pip" install protobuf
+          echo "$RUNNER_TEMP/chiaki-python/bin" >> "$GITHUB_PATH"
+
+      - name: Install Android SDK components
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-35" "build-tools;34.0.0" "build-tools;35.0.0" \
+            "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Build only ARM64
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("android/app/build.gradle")
+          text = path.read_text()
+          marker = "    defaultConfig {"
+          assert text.count(marker) == 1
+          path.write_text(text.replace(marker, marker + '\n        ndk { abiFilters "arm64-v8a" }', 1))
+          PY
+
+      - name: Test native decoder lifecycle and video timing
+        run: |
+          bash test/run-android-lifecycle-tests.sh
+          CC="cc -DCHIAKI_ANDROID_VIDEO_PACING=0" bash test/run-android-lifecycle-tests.sh
+
+      - name: Test touch input and gamepad mapping
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace --max-workers=2
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace --max-workers=2
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: chiaki-android-controles-gamepad-arm64
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,1128 @@
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index 61618b5..3481bae 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -52,6 +52,8 @@ android {
+         }
+     }
+ 
++    testOptions { unitTests.includeAndroidResources = true }
++
+     buildFeatures {
+         viewBinding true
+         prefab true
+@@ -133,4 +135,5 @@ dependencies {
+     implementation libs.oboe
+ 
+     testImplementation 'junit:junit:4.13.2'
++    testImplementation 'org.robolectric:robolectric:4.14.1'
+ }
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index a9594cb..08ec72c 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -54,6 +54,9 @@
+         <activity
+             android:name=".settings.SettingsActivity" />
+ 
++        <activity android:name=".settings.GamepadSettingsActivity"
++            android:exported="false" />
++
+         <activity
+             android:name=".regist.RegistActivity"
+             android:theme="@style/MageTheme"
+diff --git a/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt b/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
+index e6d0064..0a08f61 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
+@@ -99,6 +99,21 @@ class Preferences(context: Context)
+ 		get() = sharedPreferences.getBoolean(onScreenControlsEnabledKey, true)
+ 		set(value) { sharedPreferences.edit().putBoolean(onScreenControlsEnabledKey, value).apply() }
+ 
++	val hideTouchWithGamepadKey = "hide_touch_with_gamepad"
++	var hideTouchWithGamepad: Boolean
++		get() = sharedPreferences.getBoolean(hideTouchWithGamepadKey, false)
++		set(value) { sharedPreferences.edit().putBoolean(hideTouchWithGamepadKey, value).apply() }
++
++	fun gamepadProfile(descriptor: String): Set<String>? =
++		sharedPreferences.getStringSet("gamepad_profile:$descriptor", null)?.toSet()
++
++	fun setGamepadProfile(descriptor: String, profile: Set<String>?) {
++		sharedPreferences.edit().apply {
++			if(profile == null) remove("gamepad_profile:$descriptor")
++			else putStringSet("gamepad_profile:$descriptor", profile)
++		}.apply()
++	}
++
+ 	val touchpadOnlyEnabledKey get() = resources.getString(R.string.preferences_touchpad_only_enabled_key)
+ 	var touchpadOnlyEnabled
+ 		get() = sharedPreferences.getBoolean(touchpadOnlyEnabledKey, false)
+diff --git a/android/app/src/main/java/com/metallic/chiaki/session/GamepadMapping.kt b/android/app/src/main/java/com/metallic/chiaki/session/GamepadMapping.kt
+new file mode 100644
+index 0000000..680413e
+--- /dev/null
++++ b/android/app/src/main/java/com/metallic/chiaki/session/GamepadMapping.kt
+@@ -0,0 +1,134 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++package com.metallic.chiaki.session
++
++import android.view.InputDevice
++import android.view.KeyEvent
++import android.view.MotionEvent
++import com.metallic.chiaki.common.Preferences
++import com.metallic.chiaki.lib.ControllerState
++
++/** A saved profile maps Android input sources to PS buttons, independently of touch input. */
++object GamepadMapping {
++    val targets = linkedMapOf(
++        "cross" to "✕", "circle" to "○", "square" to "□", "triangle" to "△",
++        "up" to "↑", "down" to "↓", "left" to "←", "right" to "→",
++        "l1" to "L1", "r1" to "R1", "l2" to "L2", "r2" to "R2",
++        "l3" to "L3", "r3" to "R3", "options" to "Options",
++        "create" to "Create / Share", "ps" to "PS", "touchpad" to "Touchpad"
++    )
++    val axes = listOf(MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_RTRIGGER,
++        MotionEvent.AXIS_BRAKE, MotionEvent.AXIS_GAS, MotionEvent.AXIS_HAT_X, MotionEvent.AXIS_HAT_Y)
++    fun key(code: Int) = "key:$code"
++    fun axis(code: Int, sign: Int = 1) = "axis:$code:$sign"
++    fun isGamepad(device: InputDevice?) = device != null && !device.isVirtual &&
++        (device.supportsSource(InputDevice.SOURCE_GAMEPAD) || device.supportsSource(InputDevice.SOURCE_JOYSTICK))
++    fun sourceLabel(source: String): String {
++        val parts = source.split(':')
++        return if(parts[0] == "key") KeyEvent.keyCodeToString(parts[1].toInt()).removePrefix("KEYCODE_")
++        else "${MotionEvent.axisToString(parts[1].toInt()).removePrefix("AXIS_")} ${if(parts[2] == "-1") "−" else "+"}"
++    }
++    fun defaults(swap: Boolean): Map<String, String> = linkedMapOf(
++        key(KeyEvent.KEYCODE_BUTTON_A) to if(swap) "circle" else "cross",
++        key(KeyEvent.KEYCODE_BUTTON_B) to if(swap) "cross" else "circle",
++        key(KeyEvent.KEYCODE_BUTTON_X) to if(swap) "triangle" else "square",
++        key(KeyEvent.KEYCODE_BUTTON_Y) to if(swap) "square" else "triangle",
++        key(KeyEvent.KEYCODE_DPAD_UP) to "up", key(KeyEvent.KEYCODE_DPAD_DOWN) to "down",
++        key(KeyEvent.KEYCODE_DPAD_LEFT) to "left", key(KeyEvent.KEYCODE_DPAD_RIGHT) to "right",
++        key(KeyEvent.KEYCODE_BUTTON_L1) to "l1", key(KeyEvent.KEYCODE_BUTTON_R1) to "r1",
++        key(KeyEvent.KEYCODE_BUTTON_L2) to "l2", key(KeyEvent.KEYCODE_BUTTON_R2) to "r2",
++        key(KeyEvent.KEYCODE_BUTTON_THUMBL) to "l3", key(KeyEvent.KEYCODE_BUTTON_THUMBR) to "r3",
++        key(KeyEvent.KEYCODE_BUTTON_START) to "options", key(KeyEvent.KEYCODE_BUTTON_SELECT) to "create",
++        key(KeyEvent.KEYCODE_BUTTON_MODE) to "ps", key(KeyEvent.KEYCODE_BUTTON_C) to "ps",
++        axis(MotionEvent.AXIS_LTRIGGER) to "l2", axis(MotionEvent.AXIS_BRAKE) to "l2",
++        axis(MotionEvent.AXIS_RTRIGGER) to "r2", axis(MotionEvent.AXIS_GAS) to "r2",
++        axis(MotionEvent.AXIS_HAT_X, -1) to "left", axis(MotionEvent.AXIS_HAT_X) to "right",
++        axis(MotionEvent.AXIS_HAT_Y, -1) to "up", axis(MotionEvent.AXIS_HAT_Y) to "down"
++    )
++    fun load(preferences: Preferences, descriptor: String): Map<String, String> =
++        preferences.gamepadProfile(descriptor)?.mapNotNull {
++            val parts = it.split('=')
++            if(parts.size == 2 && parts[1] in targets) parts[0] to parts[1] else null
++        }?.toMap() ?: defaults(preferences.swapCrossMoon)
++
++    fun save(preferences: Preferences, descriptor: String, mapping: Map<String, String>) =
++        preferences.setGamepadProfile(descriptor, mapping.map { "${it.key}=${it.value}" }.toSet())
++
++    /** Assign both Android representations of a trigger/dpad to avoid duplicate old actions. */
++    fun assign(mapping: Map<String, String>, source: String, target: String): Map<String, String> {
++        val aliases = defaults(false).let { defaults ->
++            val defaultTarget = defaults[source]
++            if(defaultTarget in setOf("l2", "r2", "up", "down", "left", "right"))
++                defaults.filterValues { it == defaultTarget }.keys else setOf(source)
++        }
++        return mapping.filterValues { it != target }.toMutableMap().apply {
++            aliases.forEach { put(it, target) }
++        }
++    }
++
++    fun apply(state: ControllerState, target: String, strength: Float) {
++        val value = strength.coerceIn(0f, 1f)
++        if(target == "l2") { state.l2State = maxOf(state.l2State, (value * 255).toInt().toUByte()); return }
++        if(target == "r2") { state.r2State = maxOf(state.r2State, (value * 255).toInt().toUByte()); return }
++        if(value < 0.5f) return
++        val mask = when(target) {
++            "cross" -> ControllerState.BUTTON_CROSS
++            "circle" -> ControllerState.BUTTON_MOON
++            "square" -> ControllerState.BUTTON_BOX
++            "triangle" -> ControllerState.BUTTON_PYRAMID
++            "up" -> ControllerState.BUTTON_DPAD_UP
++            "down" -> ControllerState.BUTTON_DPAD_DOWN
++            "left" -> ControllerState.BUTTON_DPAD_LEFT
++            "right" -> ControllerState.BUTTON_DPAD_RIGHT
++            "l1" -> ControllerState.BUTTON_L1
++            "r1" -> ControllerState.BUTTON_R1
++            "l3" -> ControllerState.BUTTON_L3
++            "r3" -> ControllerState.BUTTON_R3
++            "options" -> ControllerState.BUTTON_OPTIONS
++            "create" -> ControllerState.BUTTON_SHARE
++            "ps" -> ControllerState.BUTTON_PS
++            "touchpad" -> ControllerState.BUTTON_TOUCHPAD
++            else -> 0U
++        }
++        state.buttons = state.buttons or mask
++    }
++}
++
++/** Rebuild from held sources so releasing one binding cannot release another held binding. */
++class GamepadState(private val mapping: Map<String, String>) {
++    private val held = mutableMapOf<String, Float>()
++    private val analogSources = mutableSetOf<String>()
++    private var sticks = ControllerState()
++    fun key(code: Int, down: Boolean): Boolean {
++        val source = GamepadMapping.key(code)
++        if(source !in mapping) return false
++        if(down) held[source] = 1f else held.remove(source)
++        return true
++    }
++    fun motion(event: MotionEvent) {
++        fun stick(axis: Int) = (event.getAxisValue(axis).coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt().toShort()
++        sticks = ControllerState(leftX = stick(MotionEvent.AXIS_X), leftY = stick(MotionEvent.AXIS_Y),
++            rightX = stick(MotionEvent.AXIS_Z), rightY = stick(MotionEvent.AXIS_RZ))
++        GamepadMapping.axes.forEach { axis ->
++            if(event.device?.getMotionRange(axis, event.source) != null) {
++                axis(axis, event.getAxisValue(axis))
++            }
++        }
++    }
++    internal fun axis(code: Int, rawValue: Float) {
++        for(sign in listOf(-1, 1)) {
++            val source = GamepadMapping.axis(code, sign)
++            val value = (rawValue * sign).coerceIn(0f, 1f)
++            held[source] = if(value < 0.05f) 0f else value
++            analogSources.add(source)
++        }
++    }
++    fun snapshot(): ControllerState = sticks.copy().apply {
++        held.forEach { (source, value) ->
++            val target = mapping[source] ?: return@forEach
++            val analogTrigger = target in setOf("l2", "r2") && source.startsWith("key:") &&
++                source in setOf(GamepadMapping.key(KeyEvent.KEYCODE_BUTTON_L2), GamepadMapping.key(KeyEvent.KEYCODE_BUTTON_R2)) &&
++                analogSources.any { mapping[it] == target && it.endsWith(":1") }
++            if(!analogTrigger) GamepadMapping.apply(this, target, value)
++        }
++    }
++}
+diff --git a/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt b/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
+index 822fe76..3d95c0b 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
+@@ -16,7 +16,7 @@ class StreamInput(val context: Context, val preferences: Preferences)
+ 
+ 	val controllerState: ControllerState get()
+ 	{
+-		val controllerState = sensorControllerState or keyControllerState or motionControllerState
++		val controllerState = gamepads.values.fold(sensorControllerState.copy()) { state, pad -> state or pad.snapshot() }
+ 
+ 		val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+ 		@Suppress("DEPRECATION")
+@@ -33,19 +33,17 @@ class StreamInput(val context: Context, val preferences: Preferences)
+ 			else -> {}
+ 		}
+ 
+-		// prioritize motion controller's l2 and r2 over key
+-		// (some controllers send only key, others both but key earlier than full press)
+-		if(motionControllerState.l2State > 0U)
+-			controllerState.l2State = motionControllerState.l2State
+-		if(motionControllerState.r2State > 0U)
+-			controllerState.r2State = motionControllerState.r2State
+ 
+ 		return controllerState or touchControllerState
+ 	}
+ 
+ 	private val sensorControllerState = ControllerState() // from Motion Sensors
+-	private val keyControllerState = ControllerState() // from KeyEvents
+-	private val motionControllerState = ControllerState() // from MotionEvents
++	private val gamepads = mutableMapOf<Int, GamepadState>()
++	fun resetGamepads() { gamepads.clear(); controllerStateUpdated() }
++	fun removeGamepad(id: Int) { gamepads.remove(id); controllerStateUpdated() }
++	private fun gamepad(device: InputDevice) = gamepads.getOrPut(device.id) {
++		GamepadState(GamepadMapping.load(preferences, device.descriptor))
++	}
+ 	var touchControllerState = ControllerState()
+ 		set(value)
+ 		{
+@@ -53,7 +51,6 @@ class StreamInput(val context: Context, val preferences: Preferences)
+ 			controllerStateUpdated()
+ 		}
+ 
+-	private val swapCrossMoon = preferences.swapCrossMoon
+ 
+ 	private val sensorEventListener = object: SensorEventListener {
+ 		override fun onSensorChanged(event: SensorEvent)
+@@ -120,87 +117,21 @@ class StreamInput(val context: Context, val preferences: Preferences)
+ 		controllerStateChangedCallback?.let { it(controllerState) }
+ 	}
+ 
+-	fun dispatchKeyEvent(event: KeyEvent): Boolean
+-	{
+-		//Log.i("StreamSession", "key event $event")
+-		if(event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP)
+-			return false
+-
+-		when(event.keyCode)
+-		{
+-			KeyEvent.KEYCODE_BUTTON_L2 -> {
+-				keyControllerState.l2State = if(event.action == KeyEvent.ACTION_DOWN) UByte.MAX_VALUE else 0U
+-				return true
+-			}
+-			KeyEvent.KEYCODE_BUTTON_R2 -> {
+-				keyControllerState.r2State = if(event.action == KeyEvent.ACTION_DOWN) UByte.MAX_VALUE else 0U
+-				return true
+-			}
+-		}
+-
+-		val buttonMask: UInt = when(event.keyCode)
+-		{
+-			// dpad handled by MotionEvents
+-			//KeyEvent.KEYCODE_DPAD_LEFT -> ControllerState.BUTTON_DPAD_LEFT
+-			//KeyEvent.KEYCODE_DPAD_RIGHT -> ControllerState.BUTTON_DPAD_RIGHT
+-			//KeyEvent.KEYCODE_DPAD_UP -> ControllerState.BUTTON_DPAD_UP
+-			//KeyEvent.KEYCODE_DPAD_DOWN -> ControllerState.BUTTON_DPAD_DOWN
+-			KeyEvent.KEYCODE_BUTTON_A -> if(swapCrossMoon) ControllerState.BUTTON_MOON else ControllerState.BUTTON_CROSS
+-			KeyEvent.KEYCODE_BUTTON_B -> if(swapCrossMoon) ControllerState.BUTTON_CROSS else ControllerState.BUTTON_MOON
+-			KeyEvent.KEYCODE_BUTTON_X -> if(swapCrossMoon) ControllerState.BUTTON_PYRAMID else ControllerState.BUTTON_BOX
+-			KeyEvent.KEYCODE_BUTTON_Y -> if(swapCrossMoon) ControllerState.BUTTON_BOX else ControllerState.BUTTON_PYRAMID
+-			KeyEvent.KEYCODE_BUTTON_L1 -> ControllerState.BUTTON_L1
+-			KeyEvent.KEYCODE_BUTTON_R1 -> ControllerState.BUTTON_R1
+-			KeyEvent.KEYCODE_BUTTON_THUMBL -> ControllerState.BUTTON_L3
+-			KeyEvent.KEYCODE_BUTTON_THUMBR -> ControllerState.BUTTON_R3
+-			KeyEvent.KEYCODE_BUTTON_SELECT -> ControllerState.BUTTON_SHARE
+-			KeyEvent.KEYCODE_BUTTON_START -> ControllerState.BUTTON_OPTIONS
+-			KeyEvent.KEYCODE_BUTTON_C -> ControllerState.BUTTON_PS
+-			KeyEvent.KEYCODE_BUTTON_MODE -> ControllerState.BUTTON_PS
+-			else -> return false
+-		}
+-
+-		keyControllerState.buttons = keyControllerState.buttons.run {
+-			when(event.action)
+-			{
+-				KeyEvent.ACTION_DOWN -> this or buttonMask
+-				KeyEvent.ACTION_UP -> this and buttonMask.inv()
+-				else -> this
+-			}
+-		}
+-
++	fun dispatchKeyEvent(event: KeyEvent): Boolean {
++		val device = event.device ?: return false
++		if(!GamepadMapping.isGamepad(device) ||
++			(event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP)) return false
++		if(!gamepad(device).key(event.keyCode, event.action == KeyEvent.ACTION_DOWN)) return false
+ 		controllerStateUpdated()
+ 		return true
+ 	}
+ 
+-	fun onGenericMotionEvent(event: MotionEvent): Boolean
+-	{
+-		if(event.source and InputDevice.SOURCE_CLASS_JOYSTICK != InputDevice.SOURCE_CLASS_JOYSTICK)
+-			return false
+-		fun Float.signedAxis() = (this * Short.MAX_VALUE).toInt().toShort()
+-		fun Float.unsignedAxis() = (this * UByte.MAX_VALUE.toFloat()).toUInt().toUByte()
+-		motionControllerState.leftX = event.getAxisValue(MotionEvent.AXIS_X).signedAxis()
+-		motionControllerState.leftY = event.getAxisValue(MotionEvent.AXIS_Y).signedAxis()
+-		motionControllerState.rightX = event.getAxisValue(MotionEvent.AXIS_Z).signedAxis()
+-		motionControllerState.rightY = event.getAxisValue(MotionEvent.AXIS_RZ).signedAxis()
+-		motionControllerState.l2State = event.getAxisValue(MotionEvent.AXIS_LTRIGGER).unsignedAxis()
+-		motionControllerState.r2State = event.getAxisValue(MotionEvent.AXIS_RTRIGGER).unsignedAxis()
+-		motionControllerState.buttons = motionControllerState.buttons.let {
+-			val dpadX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+-			val dpadY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+-			val dpadButtons =
+-				(if(dpadX > 0.5f) ControllerState.BUTTON_DPAD_RIGHT else 0U) or
+-						(if(dpadX < -0.5f) ControllerState.BUTTON_DPAD_LEFT else 0U) or
+-						(if(dpadY > 0.5f) ControllerState.BUTTON_DPAD_DOWN else 0U) or
+-						(if(dpadY < -0.5f) ControllerState.BUTTON_DPAD_UP else 0U)
+-			it and (ControllerState.BUTTON_DPAD_RIGHT or
+-					ControllerState.BUTTON_DPAD_LEFT or
+-					ControllerState.BUTTON_DPAD_DOWN or
+-					ControllerState.BUTTON_DPAD_UP).inv() or
+-					dpadButtons
+-		}
+-		//Log.i("StreamSession", "motionEvent => $motionControllerState")
++	fun onGenericMotionEvent(event: MotionEvent): Boolean {
++		val device = event.device ?: return false
++		if(!GamepadMapping.isGamepad(device) ||
++			!event.isFromSource(InputDevice.SOURCE_JOYSTICK) || event.actionMasked != MotionEvent.ACTION_MOVE) return false
++		gamepad(device).motion(event)
+ 		controllerStateUpdated()
+ 		return true
+ 	}
+-}
+\ No newline at end of file
++}
+diff --git a/android/app/src/main/java/com/metallic/chiaki/settings/GamepadSettingsActivity.kt b/android/app/src/main/java/com/metallic/chiaki/settings/GamepadSettingsActivity.kt
+new file mode 100644
+index 0000000..392d458
+--- /dev/null
++++ b/android/app/src/main/java/com/metallic/chiaki/settings/GamepadSettingsActivity.kt
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++package com.metallic.chiaki.settings
++
++import android.hardware.input.InputManager
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.view.InputDevice
++import android.view.KeyEvent
++import android.view.MotionEvent
++import android.widget.*
++import androidx.appcompat.app.AppCompatActivity
++import com.google.android.material.dialog.MaterialAlertDialogBuilder
++import com.metallic.chiaki.R
++import com.metallic.chiaki.common.Preferences
++import com.metallic.chiaki.session.GamepadMapping
++
++class GamepadSettingsActivity : AppCompatActivity(), InputManager.InputDeviceListener {
++    private lateinit var preferences: Preferences
++    private lateinit var inputManager: InputManager
++    private lateinit var content: LinearLayout
++    private var selectedDescriptor: String? = null
++    private var capture: ((String) -> Unit)? = null
++    private val neutralAxes = mutableSetOf<Int>()
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        title = getString(R.string.gamepad_mapping_title)
++        preferences = Preferences(this)
++        inputManager = getSystemService(INPUT_SERVICE) as InputManager
++        selectedDescriptor = savedInstanceState?.getString("gamepad_descriptor")
++        content = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            val padding = (16 * resources.displayMetrics.density).toInt()
++            setPadding(padding, padding, padding, padding)
++        }
++        setContentView(ScrollView(this).apply { addView(content) })
++    }
++    override fun onSaveInstanceState(outState: Bundle) {
++        outState.putString("gamepad_descriptor", selectedDescriptor)
++        super.onSaveInstanceState(outState)
++    }
++    override fun onResume() {
++        super.onResume()
++        inputManager.registerInputDeviceListener(this, Handler(Looper.getMainLooper()))
++        render()
++    }
++    override fun onPause() {
++        inputManager.unregisterInputDeviceListener(this)
++        capture = null
++        super.onPause()
++    }
++    override fun onInputDeviceAdded(deviceId: Int) = render()
++    override fun onInputDeviceRemoved(deviceId: Int) = render()
++    override fun onInputDeviceChanged(deviceId: Int) = render()
++
++    private fun render() {
++        content.removeAllViews()
++        content.addView(TextView(this).apply { setText(R.string.gamepad_mapping_help) })
++        val devices = InputDevice.getDeviceIds().mapNotNull { InputDevice.getDevice(it) }.filter { GamepadMapping.isGamepad(it) }
++        if(devices.isEmpty()) {
++            content.addView(TextView(this).apply { setText(R.string.gamepad_mapping_no_device) })
++            return
++        }
++        val selected = devices.find { it.descriptor == selectedDescriptor } ?: devices.first()
++        selectedDescriptor = selected.descriptor
++        content.addView(Button(this).apply {
++            text = getString(R.string.gamepad_mapping_device, selected.name)
++            setOnClickListener {
++                MaterialAlertDialogBuilder(this@GamepadSettingsActivity)
++                    .setTitle(R.string.gamepad_mapping_device_title)
++                    .setItems(devices.map { it.name }.toTypedArray()) { _, index ->
++                        selectedDescriptor = devices[index].descriptor
++                        render()
++                    }.show()
++            }
++        })
++        val mapping = GamepadMapping.load(preferences, selected.descriptor)
++        GamepadMapping.targets.forEach { (target, label) ->
++            val sources = mapping.filterValues { it == target }.keys
++            val targetLabel = if(target == "touchpad") getString(R.string.gamepad_mapping_touchpad_click) else label
++            content.addView(Button(this).apply {
++                isAllCaps = false
++                text = "$targetLabel: ${sources.joinToString(" / ") { GamepadMapping.sourceLabel(it) }.ifEmpty { getString(R.string.gamepad_mapping_unassigned) }}"
++                setOnClickListener { capture(selected, target, targetLabel) }
++            })
++        }
++        content.addView(Button(this).apply {
++            setText(R.string.gamepad_mapping_reset)
++            setOnClickListener {
++                MaterialAlertDialogBuilder(this@GamepadSettingsActivity)
++                    .setMessage(R.string.gamepad_mapping_reset_question)
++                    .setPositiveButton(android.R.string.ok) { _, _ ->
++                        preferences.setGamepadProfile(selected.descriptor, null); render()
++                    }.setNegativeButton(android.R.string.cancel, null).show()
++            }
++        })
++    }
++    private fun capture(device: InputDevice, target: String, label: String) {
++        val dialog = MaterialAlertDialogBuilder(this)
++            .setTitle(label)
++            .setMessage(R.string.gamepad_mapping_press)
++            .setNegativeButton(android.R.string.cancel, null)
++            .setNeutralButton(R.string.gamepad_mapping_clear) { _, _ ->
++                GamepadMapping.save(preferences, device.descriptor,
++                    GamepadMapping.load(preferences, device.descriptor).filterValues { it != target })
++                render()
++            }.create()
++        neutralAxes.clear()
++        capture = { source ->
++            GamepadMapping.save(preferences, device.descriptor,
++                GamepadMapping.assign(GamepadMapping.load(preferences, device.descriptor), source, target))
++            capture = null
++            dialog.dismiss()
++            render()
++        }
++        dialog.setOnDismissListener { capture = null }
++        dialog.setOnKeyListener { _, _, event ->
++            if(event.device?.descriptor != device.descriptor) false
++            else {
++                if(event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0)
++                    capture?.invoke(GamepadMapping.key(event.keyCode))
++                true
++            }
++        }
++        dialog.show()
++        dialog.window?.decorView?.setOnGenericMotionListener { _, event ->
++            if(event.device?.descriptor != device.descriptor || !event.isFromSource(InputDevice.SOURCE_JOYSTICK)) false
++            else {
++                GamepadMapping.axes.forEach { axis ->
++                    val value = event.getAxisValue(axis)
++                    if(kotlin.math.abs(value) < 0.2f) neutralAxes.add(axis)
++                    if(kotlin.math.abs(value) > 0.7f && axis in neutralAxes && capture != null)
++                        capture?.invoke(GamepadMapping.axis(axis, if(value < 0f) -1 else 1))
++                }
++                true
++            }
++        }
++    }
++}
+diff --git a/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt b/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
+index d568a51..f4c4a45 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
+@@ -28,6 +28,7 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ 		preferences.videoLowLatencyKey -> preferences.videoLowLatency
+ 		preferences.videoDiagnosticsKey -> preferences.videoDiagnostics
+ 		preferences.videoMatchRefreshKey -> preferences.videoMatchRefresh
++		preferences.hideTouchWithGamepadKey -> preferences.hideTouchWithGamepad
+ 		preferences.logVerboseKey -> preferences.logVerbose
+ 		preferences.swapCrossMoonKey -> preferences.swapCrossMoon
+ 		preferences.rumbleEnabledKey -> preferences.rumbleEnabled
+@@ -44,6 +45,7 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ 			preferences.videoLowLatencyKey -> preferences.videoLowLatency = value
+ 			preferences.videoDiagnosticsKey -> preferences.videoDiagnostics = value
+ 			preferences.videoMatchRefreshKey -> preferences.videoMatchRefresh = value
++			preferences.hideTouchWithGamepadKey -> preferences.hideTouchWithGamepad = value
+ 			preferences.logVerboseKey -> preferences.logVerbose = value
+ 			preferences.swapCrossMoonKey -> preferences.swapCrossMoon = value
+ 			preferences.rumbleEnabledKey -> preferences.rumbleEnabled = value
+@@ -155,6 +157,11 @@ class SettingsFragment: PreferenceFragmentCompat(), TitleFragment
+ 			it.entries = Preferences.codecAll.map { codec -> getString(codec.title) }.toTypedArray()
+ 		}
+ 
++		preferenceScreen.findPreference<Preference>("gamepad_mapping")?.setOnPreferenceClickListener {
++			startActivity(Intent(context, GamepadSettingsActivity::class.java))
++			true
++		}
++
+ 		val registeredHostsPreference = preferenceScreen.findPreference<Preference>("registered_hosts")
+ 		viewModel.registeredHostsCount.observe(this, Observer {
+ 			registeredHostsPreference?.summary = getString(R.string.preferences_registered_hosts_summary, it)
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+index 735ff88..fb020fe 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -6,6 +6,7 @@ import android.animation.Animator
+ import android.animation.AnimatorListenerAdapter
+ import android.app.AlertDialog
+ import android.graphics.Matrix
++import android.hardware.input.InputManager
+ import android.os.*
+ import android.view.*
+ import android.widget.EditText
+@@ -31,6 +32,7 @@ import com.metallic.chiaki.session.*
+ import com.metallic.chiaki.touchcontrols.DefaultTouchControlsFragment
+ import com.metallic.chiaki.touchcontrols.TouchpadOnlyFragment
+ import kotlinx.coroutines.Job
++import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.launchIn
+ import kotlinx.coroutines.flow.onEach
+@@ -41,7 +43,7 @@ private object StreamQuitDialog: DialogContents()
+ private object CreateErrorDialog: DialogContents()
+ private object PinRequestDialog: DialogContents()
+ 
+-class StreamActivity : AppCompatActivity()
++class StreamActivity : AppCompatActivity(), InputManager.InputDeviceListener
+ {
+ 	companion object
+ 	{
+@@ -53,6 +55,23 @@ class StreamActivity : AppCompatActivity()
+ 	private lateinit var binding: ActivityStreamBinding
+ 	private lateinit var insetsController: WindowInsetsControllerCompat
+ 
++	private val gamepadConnected = MutableStateFlow(false)
++	private val inputManager get() = getSystemService(INPUT_SERVICE) as InputManager
++	override fun onInputDeviceAdded(deviceId: Int) = refreshGamepads()
++	override fun onInputDeviceRemoved(deviceId: Int) {
++		viewModel.input.removeGamepad(deviceId)
++		refreshGamepads()
++	}
++	override fun onInputDeviceChanged(deviceId: Int) {
++		viewModel.input.removeGamepad(deviceId)
++		refreshGamepads()
++	}
++	private fun refreshGamepads() {
++		gamepadConnected.value = InputDevice.getDeviceIds().any {
++			GamepadMapping.isGamepad(InputDevice.getDevice(it))
++		}
++	}
++
+ 	private val uiVisibilityHandler = Handler(Looper.getMainLooper())
+ 
+ 	override fun onCreate(savedInstanceState: Bundle?)
+@@ -143,22 +162,24 @@ class StreamActivity : AppCompatActivity()
+ 	{
+ 		val controls = supportFragmentManager.findFragmentById(R.id.controlsFragment) as DefaultTouchControlsFragment
+ 		val touchpad = supportFragmentManager.findFragmentById(R.id.touchpadOnlyFragment) as TouchpadOnlyFragment
+-		viewModel.onScreenControlsEnabled.observe(this) {
+-			controls.requireView().isVisible = it
+-		}
+-		viewModel.touchpadOnlyEnabled.observe(this) {
+-			touchpad.requireView().isVisible = it
+-		}
+-		// Both fragments exist simultaneously. Only the enabled panel may supply input;
+-		// a hidden touchpad must not replace or cancel the full controller's events.
++		// One subscription owns input. The historical build restored a second collector
++		// that cancelled the full controller when attaching the touchpad-only fragment.
+ 		controlsJob = combine(
+ 			controls.controllerState,
+ 			touchpad.controllerState,
+ 			viewModel.onScreenControlsEnabled.asFlow(),
+-			viewModel.touchpadOnlyEnabled.asFlow()
+-		) { controlsState, touchpadState, controlsEnabled, touchpadEnabled ->
++			viewModel.touchpadOnlyEnabled.asFlow(),
++			gamepadConnected
++		) { controlsState, touchpadState, controlsEnabled, touchpadEnabled, connected ->
++			val mode = TouchControlsMode.select(controlsEnabled, touchpadEnabled,
++				connected, viewModel.preferences.hideTouchWithGamepad)
++			val fullVisible = mode == TouchControlsMode.FULL
++			if(controls.requireView().isVisible && !fullVisible) controls.resetInput()
++			if(touchpad.requireView().isVisible && !touchpadEnabled) touchpad.resetInput()
++			controls.requireView().isVisible = fullVisible
++			touchpad.requireView().isVisible = touchpadEnabled
+ 			when {
+-				controlsEnabled -> controlsState
++				fullVisible -> controlsState
+ 				touchpadEnabled -> touchpadState
+ 				else -> ControllerState()
+ 			}
+@@ -169,12 +190,19 @@ class StreamActivity : AppCompatActivity()
+ 	override fun onResume()
+ 	{
+ 		super.onResume()
++		inputManager.registerInputDeviceListener(this, uiVisibilityHandler)
++		refreshGamepads()
+ 		hideSystemUI()
+ 		viewModel.session.resume()
+ 	}
+ 
+ 	override fun onPause()
+ 	{
++		inputManager.unregisterInputDeviceListener(this)
++		viewModel.input.resetGamepads()
++		(supportFragmentManager.findFragmentById(R.id.controlsFragment) as? DefaultTouchControlsFragment)?.resetInput()
++		(supportFragmentManager.findFragmentById(R.id.touchpadOnlyFragment) as? TouchpadOnlyFragment)?.resetInput()
++		viewModel.input.touchControllerState = ControllerState()
+ 		super.onPause()
+ 		viewModel.session.pause()
+ 	}
+@@ -183,6 +211,7 @@ class StreamActivity : AppCompatActivity()
+ 	{
+ 		super.onDestroy()
+ 		controlsJob?.cancel()
++		uiVisibilityHandler.removeCallbacks(hideSystemUIRunnable)
+ 	}
+ 
+ 	private fun reconnect()
+@@ -225,7 +254,7 @@ class StreamActivity : AppCompatActivity()
+ 	override fun onWindowFocusChanged(hasFocus: Boolean)
+ 	{
+ 		super.onWindowFocusChanged(hasFocus)
+-		if(hasFocus)
++		if(hasFocus && ::insetsController.isInitialized)
+ 			hideSystemUI()
+ 	}
+ 
+@@ -357,8 +386,8 @@ class StreamActivity : AppCompatActivity()
+ 
+ 	private fun adjustStreamViewAspect() = adjustSurfaceViewAspect()
+ 
+-	override fun dispatchKeyEvent(event: KeyEvent) = viewModel.input.dispatchKeyEvent(event) || super.dispatchKeyEvent(event)
+-	override fun onGenericMotionEvent(event: MotionEvent) = viewModel.input.onGenericMotionEvent(event) || super.onGenericMotionEvent(event)
++	override fun dispatchKeyEvent(event: KeyEvent) = (::viewModel.isInitialized && viewModel.input.dispatchKeyEvent(event)) || super.dispatchKeyEvent(event)
++	override fun onGenericMotionEvent(event: MotionEvent) = (::viewModel.isInitialized && viewModel.input.onGenericMotionEvent(event)) || super.onGenericMotionEvent(event)
+ }
+ 
+ enum class TransformMode
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+index d374dc1..6fb06c5 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+@@ -39,12 +39,14 @@ class StreamViewModel(val application: Application, val connectInfo: ConnectInfo
+ 
+ 	fun setOnScreenControlsEnabled(enabled: Boolean)
+ 	{
++		if(enabled) { preferences.touchpadOnlyEnabled = false; _touchpadOnlyEnabled.value = false }
+ 		preferences.onScreenControlsEnabled = enabled
+ 		_onScreenControlsEnabled.value = enabled
+ 	}
+ 
+ 	fun setTouchpadOnlyEnabled(enabled: Boolean)
+ 	{
++		if(enabled) { preferences.onScreenControlsEnabled = false; _onScreenControlsEnabled.value = false }
+ 		preferences.touchpadOnlyEnabled = enabled
+ 		_touchpadOnlyEnabled.value = enabled
+ 	}
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/TouchControlsMode.kt b/android/app/src/main/java/com/metallic/chiaki/stream/TouchControlsMode.kt
+new file mode 100644
+index 0000000..53e6317
+--- /dev/null
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/TouchControlsMode.kt
+@@ -0,0 +1,13 @@
++package com.metallic.chiaki.stream
++
++/** Full buttons and touchpad-only are mutually exclusive. Keep user choice on disconnect. */
++enum class TouchControlsMode {
++    HIDDEN, FULL, TOUCHPAD;
++    companion object {
++        fun select(full: Boolean, touchpad: Boolean, connected: Boolean, autoHide: Boolean) = when {
++            touchpad -> TOUCHPAD
++            full && !(connected && autoHide) -> FULL
++            else -> HIDDEN
++        }
++    }
++}
+diff --git a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/ButtonView.kt b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/ButtonView.kt
+index 66a9afe..40521de 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/ButtonView.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/ButtonView.kt
+@@ -17,6 +17,7 @@ class ButtonView @JvmOverloads constructor(
+ 	context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
+ ) : View(context, attrs, defStyleAttr)
+ {
++	private val pointers = mutableSetOf<Int>()
+ 	private val haptics = ButtonHaptics(context)
+ 
+ 	var buttonPressed = false
+@@ -78,13 +79,16 @@ class ButtonView @JvmOverloads constructor(
+ 	{
+ 		when(event.actionMasked)
+ 		{
++			MotionEvent.ACTION_CANCEL -> { pointers.clear(); buttonPressed = false }
+ 			MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+ 				if(bestFittingTouchView(event.getX(event.actionIndex), event.getY(event.actionIndex)) != this)
+ 					return false
++				pointers.add(event.getPointerId(event.actionIndex))
+ 				buttonPressed = true
+ 			}
+ 			MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+-				buttonPressed = false
++				pointers.remove(event.getPointerId(event.actionIndex))
++				buttonPressed = pointers.isNotEmpty()
+ 			}
+ 		}
+ 		return true
+diff --git a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt
+index 8aff784..2715871 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt
+@@ -4,6 +4,8 @@ package com.metallic.chiaki.touchcontrols
+ 
+ import android.os.Bundle
+ import android.view.LayoutInflater
++import android.os.SystemClock
++import android.view.MotionEvent
+ import android.view.View
+ import android.view.ViewGroup
+ import androidx.fragment.app.Fragment
+@@ -37,6 +39,17 @@ abstract class TouchControlsFragment : Fragment()
+ 	val controllerState: Flow<ControllerState> get() =
+ 		_controllerStateSource.flatMapLatest { it }
+ 
++	open fun resetInput() {
++		view?.let { root ->
++			val now = SystemClock.uptimeMillis()
++			MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0f, 0f, 0).also {
++				root.dispatchTouchEvent(it)
++				it.recycle()
++			}
++		}
++		ownControllerState = ControllerState()
++	}
++
+ 	var onScreenControlsEnabled: LiveData<Boolean>? = null
+ }
+ 
+@@ -91,6 +104,18 @@ class DefaultTouchControlsFragment : TouchControlsFragment()
+ 		})
+ 	}
+ 
++	override fun resetInput() {
++		super.resetInput()
++		_binding?.touchpadView?.resetInput()
++	}
++
++	override fun onDestroyView() {
++		resetInput()
++		_controllerStateSource.value = _ownControllerStateFlow
++		_binding = null
++		super.onDestroyView()
++	}
++
+ 	private fun dpadStateChanged(direction: DPadView.Direction?)
+ 	{
+ 		ownControllerState = ownControllerState.copy().apply {
+diff --git a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchTracker.kt b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchTracker.kt
+index a1ead71..7cc427c 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchTracker.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchTracker.kt
+@@ -17,10 +17,13 @@ class TouchTracker
+ 
+ 	private var pointerId: Int? = null
+ 
++	fun reset() { pointerId = null; currentPosition = null }
++
+ 	fun touchEvent(event: MotionEvent)
+ 	{
+ 		when(event.actionMasked)
+ 		{
++			MotionEvent.ACTION_CANCEL -> reset()
+ 			MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
+ 			{
+ 				if(pointerId == null)
+diff --git a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadOnlyFragment.kt b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadOnlyFragment.kt
+index a87b90f..5afd23f 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadOnlyFragment.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadOnlyFragment.kt
+@@ -34,6 +34,18 @@ class TouchpadOnlyFragment : TouchControlsFragment()
+ 		})
+ 	}
+ 
++	override fun resetInput() {
++		super.resetInput()
++		_binding?.touchpadView?.resetInput()
++	}
++
++	override fun onDestroyView() {
++		resetInput()
++		_controllerStateSource.value = _ownControllerStateFlow
++		_binding = null
++		super.onDestroyView()
++	}
++
+ 	private fun buttonStateChanged(buttonMask: UInt) = { pressed: Boolean ->
+ 		ownControllerState = ownControllerState.copy().apply {
+ 			buttons =
+diff --git a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt
+index 004ceae..136c7ea 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt
+@@ -59,7 +59,7 @@ class TouchpadView @JvmOverloads constructor(
+ 	}
+ 	private val pointerTouches = mutableMapOf<Int, Touch>()
+ 
+-	private val _controllerState = MutableStateFlow(state.copy())
++	private val _controllerState = MutableStateFlow(snapshot())
+ 	val controllerState: StateFlow<ControllerState> get() = _controllerState.asStateFlow()
+ 
+ 	private var shortPressingTouches = listOf<Touch>()
+@@ -106,6 +106,7 @@ class TouchpadView @JvmOverloads constructor(
+ 	{
+ 		when(event.actionMasked)
+ 		{
++			MotionEvent.ACTION_CANCEL -> resetInput()
+ 			MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+ 				state.startTouch(touchX(event, event.actionIndex), touchY(event, event.actionIndex))?.let {
+ 					haptics.trigger()
+@@ -140,8 +141,8 @@ class TouchpadView @JvmOverloads constructor(
+ 						acc
+ 					else
+ 					{
+-						it.value.onMove(event.getX(event.actionIndex), event.getY(event.actionIndex))
+-						acc || state.setTouchPos(it.value.stateId, touchX(event, index), touchY(event, index))
++						it.value.onMove(event.getX(index), event.getY(index))
++						state.setTouchPos(it.value.stateId, touchX(event, index), touchY(event, index)) || acc
+ 					}
+ 				}
+ 				if(changed)
+@@ -159,9 +160,27 @@ class TouchpadView @JvmOverloads constructor(
+ 		postDelayed(shortButtonPressLiftRunnable, SHORT_BUTTON_PRESS_DURATION_MS)
+ 	}
+ 
++	private fun snapshot() = state.copy(touches = state.touches.map { it.copy() }.toTypedArray())
++
++	fun resetInput() {
++		pointerTouches.values.forEach { removeCallbacks(it.startButtonHoldRunnable) }
++		pointerTouches.clear()
++		removeCallbacks(shortButtonPressLiftRunnable)
++		shortPressingTouches = emptyList()
++		buttonHeld = false
++		state.buttons = 0U
++		state.touches.forEach { it.id = -1 }
++		triggerStateChanged()
++	}
++
++	override fun onDetachedFromWindow() {
++		resetInput()
++		super.onDetachedFromWindow()
++	}
++
+ 	private fun triggerStateChanged()
+ 	{
+ 		invalidate()
+-		_controllerState.value = state.copy()
++		_controllerState.value = snapshot()
+ 	}
+ }
+diff --git a/android/app/src/main/res/values-es/gamepad_controls.xml b/android/app/src/main/res/values-es/gamepad_controls.xml
+new file mode 100644
+index 0000000..1b12f96
+--- /dev/null
++++ b/android/app/src/main/res/values-es/gamepad_controls.xml
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="gamepad_controls_title">Gamepad</string>
++    <string name="gamepad_hide_touch_title">Ocultar botones táctiles con gamepad</string>
++    <string name="gamepad_hide_touch_summary">Oculta los controles completos al conectar un mando y los restaura al desconectarlo. El modo solo touchpad sigue disponible.</string>
++    <string name="gamepad_mapping_title">Asignar botones del gamepad</string>
++    <string name="gamepad_mapping_summary">Elige un botón de PS5 y pulsa el botón del gamepad. Se guarda un perfil por mando.</string>
++    <string name="gamepad_mapping_help">Elige el mando conectado y después un botón de PS5. Las asignaciones se aplican en la siguiente sesión. Android puede interceptar botones reservados del sistema. La asignación del touchpad envía un clic; usa la pantalla para deslizar.</string>
++    <string name="gamepad_mapping_no_device">Conecta un gamepad para configurar sus botones.</string>
++    <string name="gamepad_mapping_device">Mando: %1$s</string>
++    <string name="gamepad_mapping_device_title">Seleccionar mando</string>
++    <string name="gamepad_mapping_touchpad_click">Clic del touchpad</string>
++    <string name="gamepad_mapping_unassigned">Sin asignar</string>
++    <string name="gamepad_mapping_reset">Restaurar asignaciones predeterminadas</string>
++    <string name="gamepad_mapping_reset_question">¿Restaurar las asignaciones predeterminadas de este mando?</string>
++    <string name="gamepad_mapping_press">Pulsa el botón deseado del gamepad. Para gatillos analógicos o cruceta, suelta primero y después pulsa. Cada botón físico controla una acción de PS5.</string>
++    <string name="gamepad_mapping_clear">Quitar asignación</string>
++</resources>
+diff --git a/android/app/src/main/res/values/gamepad_controls.xml b/android/app/src/main/res/values/gamepad_controls.xml
+new file mode 100644
+index 0000000..28a2b32
+--- /dev/null
++++ b/android/app/src/main/res/values/gamepad_controls.xml
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="gamepad_controls_title">Gamepad</string>
++    <string name="gamepad_hide_touch_title">Hide touch buttons with a gamepad</string>
++    <string name="gamepad_hide_touch_summary">Hides the full controller while a gamepad is connected and restores it on disconnect. Touchpad-only mode remains available.</string>
++    <string name="gamepad_mapping_title">Gamepad button mapping</string>
++    <string name="gamepad_mapping_summary">Choose a PS5 button, then press its gamepad button. Profiles are saved per controller.</string>
++    <string name="gamepad_mapping_help">Choose the connected controller, then a PS5 button. Assignments apply on the next session. System-reserved buttons may be intercepted by Android. Touchpad mapping sends a click; use the screen for swipes.</string>
++    <string name="gamepad_mapping_no_device">Connect a gamepad to configure its buttons.</string>
++    <string name="gamepad_mapping_device">Controller: %1$s</string>
++    <string name="gamepad_mapping_device_title">Choose controller</string>
++    <string name="gamepad_mapping_touchpad_click">Touchpad click</string>
++    <string name="gamepad_mapping_unassigned">Unassigned</string>
++    <string name="gamepad_mapping_reset">Restore default mapping</string>
++    <string name="gamepad_mapping_reset_question">Restore the default mapping for this controller?</string>
++    <string name="gamepad_mapping_press">Press the desired gamepad button. For analog triggers or the d-pad, release first, then press. One physical button controls one PS5 action.</string>
++    <string name="gamepad_mapping_clear">Unassign</string>
++</resources>
+diff --git a/android/app/src/main/res/xml/preferences.xml b/android/app/src/main/res/xml/preferences.xml
+index e15730f..e0c6a33 100644
+--- a/android/app/src/main/res/xml/preferences.xml
++++ b/android/app/src/main/res/xml/preferences.xml
+@@ -2,6 +2,18 @@
+ <PreferenceScreen xmlns:app="http://schemas.android.com/apk/res-auto"
+     xmlns:tools="http://schemas.android.com/tools"
+     xmlns:android="http://schemas.android.com/apk/res/android">
++    <PreferenceCategory android:title="@string/gamepad_controls_title">
++        <SwitchPreferenceCompat
++            android:key="hide_touch_with_gamepad"
++            android:title="@string/gamepad_hide_touch_title"
++            android:summary="@string/gamepad_hide_touch_summary"
++            android:defaultValue="false" />
++        <Preference
++            android:key="gamepad_mapping"
++            android:title="@string/gamepad_mapping_title"
++            android:summary="@string/gamepad_mapping_summary" />
++    </PreferenceCategory>
++
+     <PreferenceCategory
+         app:key="category_general"
+         app:title="@string/preferences_category_title_general">
+diff --git a/android/app/src/test/java/com/metallic/chiaki/session/GamepadMappingTest.kt b/android/app/src/test/java/com/metallic/chiaki/session/GamepadMappingTest.kt
+new file mode 100644
+index 0000000..98d33ee
+--- /dev/null
++++ b/android/app/src/test/java/com/metallic/chiaki/session/GamepadMappingTest.kt
+@@ -0,0 +1,75 @@
++package com.metallic.chiaki.session
++
++import android.view.KeyEvent
++import android.view.MotionEvent
++import com.metallic.chiaki.lib.ControllerState
++import org.junit.Assert.*
++import org.junit.Test
++
++class GamepadMappingTest {
++    @Test fun everyPsButtonCanBeAssigned() {
++        for(target in GamepadMapping.targets.keys) {
++            val pad = GamepadState(mapOf(GamepadMapping.key(188) to target))
++            assertTrue(pad.key(188, true))
++            val pressed = pad.snapshot()
++            assertTrue(target, pressed.buttons != 0U || pressed.l2State > 0U || pressed.r2State > 0U)
++            pad.key(188, false)
++            assertEquals(ControllerState(), pad.snapshot())
++        }
++    }
++    @Test fun releasingOneSourceDoesNotReleaseAnother() {
++        val pad = GamepadState(mapOf(GamepadMapping.key(188) to "cross", GamepadMapping.key(189) to "cross"))
++        pad.key(188, true); pad.key(189, true); pad.key(188, false)
++        assertEquals(ControllerState.BUTTON_CROSS, pad.snapshot().buttons)
++        pad.key(189, false)
++        assertEquals(0U, pad.snapshot().buttons)
++    }
++    @Test fun digitalOnlyTriggerNotifiesOnPressAndRelease() {
++        val pad = GamepadState(GamepadMapping.defaults(false))
++        pad.key(KeyEvent.KEYCODE_BUTTON_L2, true)
++        assertEquals(255.toUByte(), pad.snapshot().l2State)
++        pad.key(KeyEvent.KEYCODE_BUTTON_L2, false)
++        assertEquals(0.toUByte(), pad.snapshot().l2State)
++    }
++    @Test fun analogTriggerPreservesMagnitudeDespiteDigitalEvent() {
++        val pad = GamepadState(GamepadMapping.defaults(false))
++        pad.key(KeyEvent.KEYCODE_BUTTON_L2, true)
++        pad.axis(MotionEvent.AXIS_LTRIGGER, 0.4f)
++        assertEquals(102.toUByte(), pad.snapshot().l2State)
++        pad.axis(MotionEvent.AXIS_LTRIGGER, 0f)
++        assertEquals(0.toUByte(), pad.snapshot().l2State)
++    }
++    @Test fun triggerRemapMovesBothRepresentations() {
++        val mapping = GamepadMapping.assign(GamepadMapping.defaults(false),
++            GamepadMapping.key(KeyEvent.KEYCODE_BUTTON_L2), "touchpad")
++        val pad = GamepadState(mapping)
++        pad.key(KeyEvent.KEYCODE_BUTTON_L2, true)
++        pad.axis(MotionEvent.AXIS_LTRIGGER, 0.8f)
++        assertEquals(ControllerState.BUTTON_TOUCHPAD, pad.snapshot().buttons)
++        assertEquals(0.toUByte(), pad.snapshot().l2State)
++    }
++    @Test fun dpadKeysAndAxesCanBeRemapped() {
++        val mapping = GamepadMapping.assign(GamepadMapping.defaults(false),
++            GamepadMapping.axis(MotionEvent.AXIS_HAT_X, -1), "ps")
++        val pad = GamepadState(mapping)
++        pad.axis(MotionEvent.AXIS_HAT_X, -1f)
++        assertEquals(ControllerState.BUTTON_PS, pad.snapshot().buttons)
++        pad.axis(MotionEvent.AXIS_HAT_X, 0f)
++        assertEquals(0U, pad.snapshot().buttons)
++        pad.key(KeyEvent.KEYCODE_DPAD_LEFT, true)
++        assertEquals(ControllerState.BUTTON_PS, pad.snapshot().buttons)
++    }
++    @Test fun customAssignmentReplacesTargetAndSourceWithoutAffectingOthers() {
++        val mapping = GamepadMapping.assign(GamepadMapping.defaults(false), GamepadMapping.key(KeyEvent.KEYCODE_BUTTON_A), "options")
++        val pad = GamepadState(mapping)
++        pad.key(KeyEvent.KEYCODE_BUTTON_A, true)
++        assertEquals(ControllerState.BUTTON_OPTIONS, pad.snapshot().buttons)
++        assertFalse(pad.key(KeyEvent.KEYCODE_BUTTON_START, true))
++    }
++    @Test fun touchAndGamepadButtonsMerge() {
++        val pad = GamepadState(GamepadMapping.defaults(false))
++        pad.key(KeyEvent.KEYCODE_BUTTON_A, true)
++        val state = pad.snapshot() or ControllerState(buttons = ControllerState.BUTTON_TOUCHPAD)
++        assertEquals(ControllerState.BUTTON_CROSS or ControllerState.BUTTON_TOUCHPAD, state.buttons)
++    }
++}
+diff --git a/android/app/src/test/java/com/metallic/chiaki/stream/TouchControlsModeTest.kt b/android/app/src/test/java/com/metallic/chiaki/stream/TouchControlsModeTest.kt
+new file mode 100644
+index 0000000..a78adaa
+--- /dev/null
++++ b/android/app/src/test/java/com/metallic/chiaki/stream/TouchControlsModeTest.kt
+@@ -0,0 +1,21 @@
++package com.metallic.chiaki.stream
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class TouchControlsModeTest {
++    @Test fun autoHideRestoresButtonsOnDisconnect() {
++        assertEquals(TouchControlsMode.FULL, TouchControlsMode.select(true, false, false, true))
++        assertEquals(TouchControlsMode.HIDDEN, TouchControlsMode.select(true, false, true, true))
++        assertEquals(TouchControlsMode.FULL, TouchControlsMode.select(true, false, false, true))
++    }
++    @Test fun disabledButtonsStayDisabledAfterDisconnect() {
++        assertEquals(TouchControlsMode.HIDDEN, TouchControlsMode.select(false, false, false, true))
++    }
++    @Test fun autoHideIsOptional() {
++        assertEquals(TouchControlsMode.FULL, TouchControlsMode.select(true, false, true, false))
++    }
++    @Test fun touchpadRemainsAvailableWithGamepad() {
++        assertEquals(TouchControlsMode.TOUCHPAD, TouchControlsMode.select(true, true, true, true))
++    }
++}
+diff --git a/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchInputTest.kt b/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchInputTest.kt
+new file mode 100644
+index 0000000..adcc3c4
+--- /dev/null
++++ b/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchInputTest.kt
+@@ -0,0 +1,62 @@
++package com.metallic.chiaki.touchcontrols
++
++import android.view.MotionEvent
++import org.robolectric.RuntimeEnvironment
++import android.content.Context
++import org.junit.Assert.*
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [28])
++class TouchInputTest {
++    private fun event(action: Int, x: Float = 10f) = MotionEvent.obtain(0, 0, action, x, 10f, 0)
++    @Test fun profilePersistsPerController() {
++        val context = RuntimeEnvironment.getApplication()
++        val prefs = com.metallic.chiaki.common.Preferences(context)
++        val mapping = mapOf("key:188" to "touchpad")
++        com.metallic.chiaki.session.GamepadMapping.save(prefs, "controller-one", mapping)
++        assertEquals(mapping, com.metallic.chiaki.session.GamepadMapping.load(
++            com.metallic.chiaki.common.Preferences(context), "controller-one"))
++        assertNotEquals(mapping, com.metallic.chiaki.session.GamepadMapping.load(prefs, "controller-two"))
++        prefs.setGamepadProfile("controller-one", null)
++        assertEquals(com.metallic.chiaki.session.GamepadMapping.defaults(prefs.swapCrossMoon),
++            com.metallic.chiaki.session.GamepadMapping.load(prefs, "controller-one"))
++    }
++    @Test fun cancelReleasesButton() {
++        val button = ButtonView(RuntimeEnvironment.getApplication())
++        button.layout(0, 0, 100, 100)
++        val states = mutableListOf<Boolean>()
++        button.buttonPressedCallback = { states.add(it) }
++        event(MotionEvent.ACTION_DOWN).also { button.onTouchEvent(it); it.recycle() }
++        assertTrue(button.buttonPressed)
++        event(MotionEvent.ACTION_CANCEL).also { button.onTouchEvent(it); it.recycle() }
++        assertFalse(button.buttonPressed)
++        assertEquals(listOf(true, false), states)
++    }
++    @Test fun cancelReleasesStickPointerAndAllowsNextTouch() {
++        val tracker = TouchTracker()
++        event(MotionEvent.ACTION_DOWN).also { tracker.touchEvent(it); it.recycle() }
++        assertNotNull(tracker.currentPosition)
++        event(MotionEvent.ACTION_CANCEL).also { tracker.touchEvent(it); it.recycle() }
++        assertNull(tracker.currentPosition)
++        event(MotionEvent.ACTION_DOWN, 20f).also { tracker.touchEvent(it); it.recycle() }
++        assertEquals(20f, tracker.currentPosition!!.x)
++    }
++    @Test fun touchpadPublishesIndependentSnapshotsAndResetsTouches() {
++        val touchpad = TouchpadView(RuntimeEnvironment.getApplication())
++        touchpad.layout(0, 0, 100, 100)
++        event(MotionEvent.ACTION_DOWN).also { touchpad.onTouchEvent(it); it.recycle() }
++        val first = touchpad.controllerState.value
++        val firstX = first.touches[0].x
++        event(MotionEvent.ACTION_MOVE, 50f).also { touchpad.onTouchEvent(it); it.recycle() }
++        val moved = touchpad.controllerState.value
++        assertEquals(firstX, first.touches[0].x)
++        assertNotEquals(firstX, moved.touches[0].x)
++        touchpad.resetInput()
++        assertTrue(touchpad.controllerState.value.touches.all { it.id < 0 })
++        assertEquals(0U, touchpad.controllerState.value.buttons)
++    }
++}
