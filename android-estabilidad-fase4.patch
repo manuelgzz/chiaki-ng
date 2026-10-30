@@ -1,0 +1,413 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index e0f724e..c98a5df 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -295,6 +295,18 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject
+ 	session->video_decoder.low_latency = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoLowLatency", "Z"));
+ 	session->video_decoder.diagnostics = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoDiagnostics", "Z"));
+ 
++	session->video_decoder.pacing_enabled = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoPacing", "Z"));
++	jint horizon = E->GetIntField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoPacingHorizon", "I"));
++	session->video_decoder.pacing_horizon = horizon >= 1 && horizon <= 4 ? (unsigned)horizon : 2;
++	jint interval = E->GetIntField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoDiagnosticsInterval", "I"));
++	session->video_decoder.diagnostics_interval_s = interval == 1 || interval == 5 || interval == 10 ? (unsigned)interval : 5;
++	CHIAKI_LOGI(log, "[android-config] resolution=%dx%d fps=%u bitrate_kbps=%u codec=%d low_latency=%d pacing=%d horizon_frames=%u diagnostics=%d diagnostics_interval_s=%u",
++		connect_info.video_profile.width, connect_info.video_profile.height,
++		session->video_decoder.target_fps, connect_info.video_profile.bitrate,
++		(int)session->video_decoder.target_codec, session->video_decoder.low_latency,
++		session->video_decoder.pacing_enabled, session->video_decoder.pacing_horizon,
++		session->video_decoder.diagnostics, session->video_decoder.diagnostics_interval_s);
++
+ 	err = android_chiaki_audio_decoder_init(&session->audio_decoder, log);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 28eef44..00200f4 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -31,6 +31,9 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
+ 	atomic_init(&decoder->recovered_samples, 0);
+ 	decoder->low_latency = false;
+ 	decoder->diagnostics = true;
++	decoder->pacing_enabled = CHIAKI_ANDROID_VIDEO_PACING != 0;
++	decoder->pacing_horizon = 2;
++	decoder->diagnostics_interval_s = 5;
+ 	atomic_init(&decoder->samples_submitted, 0);
+ 	atomic_init(&decoder->input_timeouts, 0);
+ 	atomic_init(&decoder->queue_errors, 0);
+@@ -268,7 +271,7 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 	uint64_t release_errors = 0;
+ 	AndroidVideoPacing pacing = {0};
+ 	uint64_t pacing_drops = 0, pacing_rebases = 0, max_schedule_ahead_us = 0;
+-	CHIAKI_LOGI(decoder->log, "[android-pacing] enabled=%d horizon_frames=2", CHIAKI_ANDROID_VIDEO_PACING);
++	CHIAKI_LOGI(decoder->log, "[android-pacing] enabled=%d horizon_frames=%u", decoder->pacing_enabled, decoder->pacing_horizon);
+ 	uint64_t gap_threshold_us = 1500000 / (decoder->target_fps ? decoder->target_fps : 60);
+ 	while(!atomic_load(&decoder->shutdown_output))
+ 	{
+@@ -280,11 +283,11 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 		{
+ 			bool render = info.size != 0 && !(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG);
+ 			media_status_t result;
+-            if(render && CHIAKI_ANDROID_VIDEO_PACING)
++            if(render && decoder->pacing_enabled)
+             {
+                 uint64_t now_ns = chiaki_time_now_monotonic_us() * 1000;
+                 bool rebased;
+-                uint64_t target = android_video_pacing_target(&pacing, now_ns, decoder->target_fps, &rebased);
++                uint64_t target = android_video_pacing_target(&pacing, now_ns, decoder->target_fps, decoder->pacing_horizon, &rebased);
+                 if(rebased) pacing_rebases++;
+                 if(target)
+                 {
+@@ -319,7 +322,7 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 				break;
+ 		}
+ 		uint64_t now = chiaki_time_now_monotonic_us();
+-		if(decoder->diagnostics && now - report_start >= 5000000)
++		if(decoder->diagnostics && now - report_start >= (uint64_t)decoder->diagnostics_interval_s * 1000000)
+ 		{
+ 			CHIAKI_LOGI(decoder->log, "[android-video] window_ms=%" PRIu64 " output=%" PRIu64
+ 				" max_output_gap_us=%" PRIu64 " gaps_over_threshold=%" PRIu64 " gap_threshold_us=%" PRIu64
+diff --git a/android/app/src/main/cpp/video-decoder.h b/android/app/src/main/cpp/video-decoder.h
+index 70fdc9e..7d03797 100644
+--- a/android/app/src/main/cpp/video-decoder.h
++++ b/android/app/src/main/cpp/video-decoder.h
+@@ -26,6 +26,9 @@ typedef struct android_chiaki_video_decoder_t
+ 	atomic_uint_fast64_t recovered_samples;
+ 	bool low_latency;
+ 	bool diagnostics;
++	bool pacing_enabled;
++	unsigned pacing_horizon;
++	unsigned diagnostics_interval_s;
+ 	atomic_uint_fast64_t samples_submitted;
+ 	atomic_uint_fast64_t input_timeouts;
+ 	atomic_uint_fast64_t queue_errors;
+diff --git a/android/app/src/main/cpp/video-pacing.h b/android/app/src/main/cpp/video-pacing.h
+index 6d1b4b3..6f3bd81 100644
+--- a/android/app/src/main/cpp/video-pacing.h
++++ b/android/app/src/main/cpp/video-pacing.h
+@@ -8,9 +8,10 @@
+ // Monotonic nanoseconds; a bounded Surface schedule, not a network jitter buffer.
+ typedef struct { uint64_t next_ns; } AndroidVideoPacing;
+ static inline uint64_t android_video_pacing_target(AndroidVideoPacing *p,
+-        uint64_t now_ns, unsigned fps, bool *rebased)
++        uint64_t now_ns, unsigned fps, unsigned horizon, bool *rebased)
+ {
+     if(fps != 30 && fps != 60) fps = 60;
++    if(horizon < 1 || horizon > 4) horizon = 2;
+     const uint64_t interval = 1000000000ULL / fps;
+     *rebased = false;
+     if(!p->next_ns || p->next_ns < now_ns)
+@@ -19,7 +20,7 @@ static inline uint64_t android_video_pacing_target(AndroidVideoPacing *p,
+         p->next_ns = now_ns + interval;
+     }
+     // Do not build an unbounded Surface queue if a burst outruns presentation.
+-    if(p->next_ns > now_ns + 2 * interval) return 0;
++    if(p->next_ns > now_ns + horizon * interval) return 0;
+     uint64_t target = p->next_ns;
+     p->next_ns += interval;
+     return target;
+diff --git a/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt b/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
+index a81ce05..e6d0064 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/common/Preferences.kt
+@@ -59,6 +59,21 @@ class Preferences(context: Context)
+ 
+ 	private val resources = context.resources
+ 
++	val videoPacingKey = "video_pacing"
++	var videoPacing: Boolean
++		get() = sharedPreferences.getBoolean(videoPacingKey, true)
++		set(value) { sharedPreferences.edit().putBoolean(videoPacingKey, value).apply() }
++
++	val videoPacingHorizonKey = "video_pacing_horizon"
++	var videoPacingHorizon: Int
++		get() = sharedPreferences.getString(videoPacingHorizonKey, "2")?.toIntOrNull()?.takeIf { it in 1..4 } ?: 2
++		set(value) { sharedPreferences.edit().putString(videoPacingHorizonKey, value.coerceIn(1, 4).toString()).apply() }
++
++	val videoDiagnosticsIntervalKey = "video_diagnostics_interval"
++	var videoDiagnosticsInterval: Int
++		get() = sharedPreferences.getString(videoDiagnosticsIntervalKey, "5")?.toIntOrNull()?.takeIf { it in listOf(1, 5, 10) } ?: 5
++		set(value) { sharedPreferences.edit().putString(videoDiagnosticsIntervalKey, (if(value in listOf(1, 5, 10)) value else 5).toString()).apply() }
++
+ 	val videoLowLatencyKey = "video_low_latency"
+ 	var videoLowLatency: Boolean
+ 		get() = sharedPreferences.getBoolean(videoLowLatencyKey, false)
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index 466489e..2e9a823 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -71,7 +71,10 @@ data class ConnectInfo(
+ 	val morning: ByteArray,
+ 	val videoProfile: ConnectVideoProfile,
+ 	val videoLowLatency: Boolean = false,
+-	val videoDiagnostics: Boolean = true
++	val videoDiagnostics: Boolean = true,
++	val videoPacing: Boolean = true,
++	val videoPacingHorizon: Int = 2,
++	val videoDiagnosticsInterval: Int = 5
+ ): Parcelable
+ 
+ private class ChiakiNative
+diff --git a/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt b/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
+index 0e97deb..d568a51 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/settings/SettingsFragment.kt
+@@ -24,6 +24,7 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ {
+ 	override fun getBoolean(key: String?, defValue: Boolean) = when(key)
+ 	{
++		preferences.videoPacingKey -> preferences.videoPacing
+ 		preferences.videoLowLatencyKey -> preferences.videoLowLatency
+ 		preferences.videoDiagnosticsKey -> preferences.videoDiagnostics
+ 		preferences.videoMatchRefreshKey -> preferences.videoMatchRefresh
+@@ -39,6 +40,7 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ 	{
+ 		when(key)
+ 		{
++			preferences.videoPacingKey -> preferences.videoPacing = value
+ 			preferences.videoLowLatencyKey -> preferences.videoLowLatency = value
+ 			preferences.videoDiagnosticsKey -> preferences.videoDiagnostics = value
+ 			preferences.videoMatchRefreshKey -> preferences.videoMatchRefresh = value
+@@ -52,6 +54,8 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ 
+ 	override fun getString(key: String, defValue: String?) = when(key)
+ 	{
++		preferences.videoPacingHorizonKey -> preferences.videoPacingHorizon.toString()
++		preferences.videoDiagnosticsIntervalKey -> preferences.videoDiagnosticsInterval.toString()
+ 		preferences.resolutionKey -> preferences.resolution.value
+ 		preferences.fpsKey -> preferences.fps.value
+ 		preferences.bitrateKey -> preferences.bitrate?.toString() ?: ""
+@@ -63,6 +67,8 @@ class DataStore(val preferences: Preferences): PreferenceDataStore()
+ 	{
+ 		when(key)
+ 		{
++			preferences.videoPacingHorizonKey -> preferences.videoPacingHorizon = value?.toIntOrNull() ?: 2
++			preferences.videoDiagnosticsIntervalKey -> preferences.videoDiagnosticsInterval = value?.toIntOrNull() ?: 5
+ 			preferences.resolutionKey ->
+ 			{
+ 				val resolution = Preferences.Resolution.values().firstOrNull { it.value == value } ?: return
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+index e0d439c..d374dc1 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+@@ -19,7 +19,10 @@ class StreamViewModel(val application: Application, val connectInfo: ConnectInfo
+ 	val input = StreamInput(application, preferences)
+ 	val session = StreamSession(connectInfo.copy(
+ 		videoLowLatency = preferences.videoLowLatency,
+-		videoDiagnostics = preferences.videoDiagnostics
++		videoDiagnostics = preferences.videoDiagnostics,
++		videoPacing = preferences.videoPacing,
++		videoPacingHorizon = preferences.videoPacingHorizon,
++		videoDiagnosticsInterval = preferences.videoDiagnosticsInterval
+ 	), logManager, preferences.logVerbose, input)
+ 
+ 	private var _onScreenControlsEnabled = MutableLiveData<Boolean>(preferences.onScreenControlsEnabled)
+diff --git a/android/app/src/main/res/values-es/video_diagnostics.xml b/android/app/src/main/res/values-es/video_diagnostics.xml
+index 044322a..e1ff788 100644
+--- a/android/app/src/main/res/values-es/video_diagnostics.xml
++++ b/android/app/src/main/res/values-es/video_diagnostics.xml
+@@ -5,7 +5,7 @@
+     <string name="video_match_refresh_title">Ajustar pantalla al video</string>
+     <string name="video_match_refresh_summary">Solicita a Android 11 o posterior una frecuencia de pantalla compatible con la transmisión. El sistema puede ignorarla. Reconecta para aplicar.</string>
+     <string name="video_diagnostics_title">Diagnóstico de tiempos de video</string>
+-    <string name="video_diagnostics_summary">Guarda un resumen cada 5 segundos en el registro: esperas, intervalos de salida y errores del decodificador. No mide FPS de pantalla ni latencia de red.</string>
++    <string name="video_diagnostics_summary">Guarda un resumen a intervalos configurables en el registro: esperas, intervalos de salida y errores del decodificador. No mide FPS de pantalla ni latencia de red.</string>
+     <string name="video_bitrate_presets_title">Selección rápida de bitrate</string>
+     <string name="video_bitrate_presets_summary">Automático o 5, 8, 10, 15, 20 Mbps. Usa Bitrate para un valor en kbps; déjalo vacío para usar el preajuste de resolución. Reconecta para aplicar.</string>
+ </resources>
+diff --git a/android/app/src/main/res/values-es/video_testing.xml b/android/app/src/main/res/values-es/video_testing.xml
+new file mode 100644
+index 0000000..71450c0
+--- /dev/null
++++ b/android/app/src/main/res/values-es/video_testing.xml
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="video_pacing_title">Regular ritmo de video (pacing)</string>
++    <string name="video_pacing_summary">Programa la entrega de video para regular su ritmo; puede añadir latencia y descartar cuadros acumulados. Desactiva para comparar entrega inmediata. Reconecta para aplicar.</string>
++    <string name="video_pacing_horizon_title">Horizonte de pacing (reconectar)</string>
++    <string name="video_diagnostics_interval_title">Intervalo del diagnóstico (reconectar)</string>
++    <string-array name="video_pacing_horizon_entries">
++        <item>1 fotograma</item>
++        <item>2 fotogramas (predeterminado)</item>
++        <item>3 fotogramas</item>
++        <item>4 fotogramas</item>
++    </string-array>
++    <string-array name="video_diagnostics_interval_entries">
++        <item>1 segundo</item>
++        <item>5 segundos</item>
++        <item>10 segundos</item>
++    </string-array>
++</resources>
+diff --git a/android/app/src/main/res/values/video_diagnostics.xml b/android/app/src/main/res/values/video_diagnostics.xml
+index 6e97478..d269283 100644
+--- a/android/app/src/main/res/values/video_diagnostics.xml
++++ b/android/app/src/main/res/values/video_diagnostics.xml
+@@ -5,7 +5,7 @@
+     <string name="video_match_refresh_title">Match display to video</string>
+     <string name="video_match_refresh_summary">Ask Android 11 or newer for a display refresh rate compatible with the stream. The system may ignore this request. Reconnect to apply.</string>
+     <string name="video_diagnostics_title">Video timing diagnostics</string>
+-    <string name="video_diagnostics_summary">Write a summary every 5 seconds to the session log: decoder waits, output gaps and errors. These are decoder measurements, not display FPS or network latency.</string>
++    <string name="video_diagnostics_summary">Write a summary at configurable intervals to the session log: decoder waits, output gaps and errors. These are decoder measurements, not display FPS or network latency.</string>
+     <string name="video_bitrate_presets_title">Quick bitrate selection</string>
+     <string name="video_bitrate_presets_summary">Auto or 5, 8, 10, 15, 20 Mbps. Use Bitrate for a custom value in kbps; leave it blank for the resolution preset. Reconnect to apply.</string>
+ </resources>
+diff --git a/android/app/src/main/res/values/video_testing.xml b/android/app/src/main/res/values/video_testing.xml
+new file mode 100644
+index 0000000..89fd4de
+--- /dev/null
++++ b/android/app/src/main/res/values/video_testing.xml
+@@ -0,0 +1,29 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="video_pacing_title">Video frame pacing</string>
++    <string name="video_pacing_summary">Schedule video delivery at a regular cadence; may add latency and drop queued frames. Disable to compare immediate delivery. Reconnect to apply.</string>
++    <string name="video_pacing_horizon_title">Pacing horizon (reconnect)</string>
++    <string name="video_diagnostics_interval_title">Diagnostic interval (reconnect)</string>
++    <string-array name="video_pacing_horizon_entries">
++        <item>1 frame</item>
++        <item>2 frames (default)</item>
++        <item>3 frames</item>
++        <item>4 frames</item>
++    </string-array>
++    <string-array name="video_diagnostics_interval_entries">
++        <item>1 second</item>
++        <item>5 seconds</item>
++        <item>10 seconds</item>
++    </string-array>
++    <string-array name="video_pacing_horizon_values" translatable="false">
++        <item>1</item>
++        <item>2</item>
++        <item>3</item>
++        <item>4</item>
++    </string-array>
++    <string-array name="video_diagnostics_interval_values" translatable="false">
++        <item>1</item>
++        <item>5</item>
++        <item>10</item>
++    </string-array>
++</resources>
+diff --git a/android/app/src/main/res/xml/preferences.xml b/android/app/src/main/res/xml/preferences.xml
+index 4169bb9..e15730f 100644
+--- a/android/app/src/main/res/xml/preferences.xml
++++ b/android/app/src/main/res/xml/preferences.xml
+@@ -82,6 +82,27 @@
+             app:summary="%s"
+             app:icon="@drawable/ic_codec"/>
+ 
++        <SwitchPreference
++            app:key="video_pacing"
++            app:defaultValue="true"
++            app:title="@string/video_pacing_title"
++            app:summary="@string/video_pacing_summary" />
++        <ListPreference
++            app:key="video_pacing_horizon"
++            app:dependency="video_pacing"
++            app:defaultValue="2"
++            app:title="@string/video_pacing_horizon_title"
++            app:entries="@array/video_pacing_horizon_entries"
++            app:entryValues="@array/video_pacing_horizon_values"
++            app:summary="%s" />
++        <ListPreference
++            app:key="video_diagnostics_interval"
++            app:dependency="video_diagnostics"
++            app:defaultValue="5"
++            app:title="@string/video_diagnostics_interval_title"
++            app:entries="@array/video_diagnostics_interval_entries"
++            app:entryValues="@array/video_diagnostics_interval_values"
++            app:summary="%s" />
+         <SwitchPreference
+             app:key="video_low_latency"
+             app:title="@string/video_low_latency_title"
+diff --git a/test/android_decoder_lifecycle.c b/test/android_decoder_lifecycle.c
+index a1c1663..391f0f6 100644
+--- a/test/android_decoder_lifecycle.c
++++ b/test/android_decoder_lifecycle.c
+@@ -18,6 +18,7 @@ static atomic_int output_polls;
+ static atomic_int pending_outputs;
+ static atomic_int rendered_outputs;
+ static atomic_int timing_reports;
++static atomic_int timed_outputs;
+ static void capture_log(ChiakiLogLevel level, const char *msg, void *user) {
+  (void)level;(void)user;
+  if(strstr(msg,"[android-video] window_ms=")) {
+@@ -66,26 +67,35 @@ ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *c,AMediaCodecBufferInfo *i,
+ media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *c,size_t i,_Bool r) { (void)c;(void)i;if(r)atomic_fetch_add(&rendered_outputs,1);return 0; }
+ media_status_t AMediaCodec_releaseOutputBufferAtTime(AMediaCodec *c,size_t i,int64_t target) {
+  uint64_t now=chiaki_time_now_monotonic_us()*1000;
+- assert(target>0 && (uint64_t)target<=now+33333334ULL);
++ assert(target>0 && (uint64_t)target<=now+66666668ULL);
++ atomic_fetch_add(&timed_outputs,1);
+  return AMediaCodec_releaseOutputBuffer(c,i,true);
+ }
+ static void test_pacing(void) {
+  for(unsigned fps=30;fps<=60;fps+=30) {
+-  uint64_t interval=1000000000ULL/fps, now=1000000000ULL;
+-  AndroidVideoPacing p={0};bool rebased;
+-  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+interval && !rebased);
+-  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+2*interval);
+-  assert(android_video_pacing_target(&p,now,fps,&rebased)==0);
+-  now+=interval;
+-  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+2*interval);
+-  now+=10*interval;
+-  assert(android_video_pacing_target(&p,now,fps,&rebased)==now+interval && rebased);
+-  for(int n=0;n<10000;n++) {
++  for(unsigned horizon=1;horizon<=4;horizon++) {
++   uint64_t interval=1000000000ULL/fps, now=1000000000ULL;
++   AndroidVideoPacing p={0};bool rebased;
++   for(unsigned n=1;n<=horizon;n++)
++    assert(android_video_pacing_target(&p,now,fps,horizon,&rebased)==now+n*interval && !rebased);
++   assert(android_video_pacing_target(&p,now,fps,horizon,&rebased)==0);
+    now+=interval;
+-   uint64_t target=android_video_pacing_target(&p,now,fps,&rebased);
+-   assert(target==now+interval && !rebased);
++   assert(android_video_pacing_target(&p,now,fps,horizon,&rebased)==now+horizon*interval);
++   now+=10*interval;
++   assert(android_video_pacing_target(&p,now,fps,horizon,&rebased)==now+interval && rebased);
++   for(int n=0;n<10000;n++) {
++    now+=interval;
++    assert(android_video_pacing_target(&p,now,fps,horizon,&rebased)==now+interval && !rebased);
++   }
+   }
+  }
++ for(unsigned invalid=0;invalid<=5;invalid+=5) {
++  AndroidVideoPacing p={0};bool rebased;
++  uint64_t now=1000000000ULL, interval=1000000000ULL/60;
++  assert(android_video_pacing_target(&p,now,0,invalid,&rebased)==now+interval);
++  assert(android_video_pacing_target(&p,now,0,invalid,&rebased)==now+2*interval);
++  assert(android_video_pacing_target(&p,now,0,invalid,&rebased)==0);
++ }
+ }
+ static void *check_unlocked(void *arg) { ChiakiMutex *m=arg;assert(chiaki_mutex_trylock(m)==CHIAKI_ERR_SUCCESS);chiaki_mutex_unlock(m);return NULL; }
+ static void unlocked(ChiakiMutex *m) { ChiakiThread t;assert(chiaki_thread_create(&t,check_unlocked,m)==CHIAKI_ERR_SUCCESS);chiaki_thread_join(&t,NULL); }
+@@ -100,6 +110,10 @@ int main(void)
+  android_chiaki_video_decoder_set_surface(&v,NULL,NULL);unlocked(&v.codec_mutex);
+  v.low_latency=true;
+  for(int n=0;n<30;n++) {
++  v.pacing_enabled = n % 2 != 0;
++  v.pacing_horizon = 1 + n % 4;
++  v.diagnostics_interval_s = n == 0 ? 1 : 5;
++  int timed_before = atomic_load(&timed_outputs);
+   android_chiaki_video_decoder_set_surface(&v,NULL,(jobject)1);
+   usleep(2000);
+   assert(android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));
+@@ -119,9 +133,10 @@ int main(void)
+   fail_queue=1;assert(!android_chiaki_video_decoder_video_sample(sample,sizeof(sample),0,false,&v));fail_queue=0;
+   ANativeWindow *old=v.window;fail_swap=1;
+   android_chiaki_video_decoder_set_surface(&v,NULL,(jobject)1);assert(v.window==old && windows==1);fail_swap=0;
+-  if(n==0) { usleep(5100000);assert(atomic_load(&timing_reports)==1); }
++  if(n==0) { usleep(1100000);assert(atomic_load(&timing_reports)==1); }
+   usleep(5000);assert(atomic_load(&rendered_outputs)>0);
+   android_chiaki_video_decoder_set_surface(&v,NULL,NULL);unlocked(&v.codec_mutex);
++  assert(v.pacing_enabled ? atomic_load(&timed_outputs)>timed_before : atomic_load(&timed_outputs)==timed_before);
+   assert(!v.codec && !v.window && !v.output_thread_started);assert(codecs==0 && windows==0);
+  }
+  android_chiaki_video_decoder_fini(&v);
+@@ -146,6 +161,6 @@ int main(void)
+   unlocked(&a.codec_mutex);android_chiaki_audio_decoder_fini(&a);
+   fail_configure=fail_start=0;assert(codecs==0);
+  }
+- puts("PASS: output progresses during input wait, real-time PTS, oversize rejection, low-latency hints, periodic diagnostic report;  30 video cycles, 30 audio reconfiguration cycles, input/queue/surface/configure/start errors, cross-thread unlock and resource balance");
++ puts("PASS: runtime pacing enabled/disabled, horizons 1-4 at 30/60 FPS, invalid defaults, one-second diagnostics; output progresses during input wait, real-time PTS, oversize rejection, low-latency hints, periodic diagnostic report;  30 video cycles, 30 audio reconfiguration cycles, input/queue/surface/configure/start errors, cross-thread unlock and resource balance");
+  return 0;
+ }
