@@ -8,7 +8,7 @@ No ejecutar el paso antiguo que restaura StreamActivity desde 14955e5: cancelaba
 
 1. Instalar el APK del workflow **Build Android Touch and Gamepad APK**.
 2. En Ajustes → Gamepad, activar **Ocultar botones táctiles con gamepad** si se desea.
-   Al desconectar el mando vuelven los controles que estaban habilitados. El modo solo touchpad sigue disponible.
+   Al desconectar el mando vuelven los controles que estaban habilitados. El touchpad permanece siempre activo, invisible en reposo, en la misma zona superior central con o sin botones.
 3. En **Asignar botones del gamepad**, seleccionar el mando conectado y el botón de PS5 de destino.
 4. Pulsar el botón físico. Para cruceta/gatillos analógicos, soltar y volver a pulsar.
    Las asignaciones se guardan por descriptor de mando y se aplican al iniciar la siguiente sesión.
@@ -17,7 +17,7 @@ No ejecutar el paso antiguo que restaura StreamActivity desde 14955e5: cancelaba
 Destinos: cruz, círculo, cuadrado, triángulo, cruceta, L1/R1/L2/R2/L3/R3, Options, Create/Share, PS y clic del touchpad.
 Los sticks conservan su movimiento analógico. Los gatillos conservan su intensidad cuando se asignan a L2/R2.
 Cada entrada física controla un destino; si se reasigna un botón ya usado, deja su acción anterior.
-El clic del touchpad es asignable; los deslizamientos se hacen con el touchpad en pantalla.
+El clic del touchpad es asignable; los deslizamientos se hacen con el touchpad en pantalla. Al tocar su zona aparece con una transición breve; el clic se muestra también después de levantar el dedo y se desvanece al terminar.
 El botón de silenciar micrófono no está expuesto por el protocolo de entrada Android de esta base.
 Android puede interceptar PS/Home u otros botones del sistema antes de entregarlos a la app.
 

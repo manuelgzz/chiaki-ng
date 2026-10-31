@@ -523,7 +523,7 @@ index d568a51..f4c4a45 100644
  		viewModel.registeredHostsCount.observe(this, Observer {
  			registeredHostsPreference?.summary = getString(R.string.preferences_registered_hosts_summary, it)
 diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
-index 735ff88..fb020fe 100644
+index 735ff88..93e05c1 100644
 --- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
 +++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
 @@ -6,6 +6,7 @@ import android.animation.Animator
@@ -575,7 +575,7 @@ index 735ff88..fb020fe 100644
  	private val uiVisibilityHandler = Handler(Looper.getMainLooper())
  
  	override fun onCreate(savedInstanceState: Bundle?)
-@@ -143,22 +162,24 @@ class StreamActivity : AppCompatActivity()
+@@ -143,25 +162,24 @@ class StreamActivity : AppCompatActivity()
  	{
  		val controls = supportFragmentManager.findFragmentById(R.id.controlsFragment) as DefaultTouchControlsFragment
  		val touchpad = supportFragmentManager.findFragmentById(R.id.touchpadOnlyFragment) as TouchpadOnlyFragment
@@ -595,23 +595,27 @@ index 735ff88..fb020fe 100644
  			viewModel.onScreenControlsEnabled.asFlow(),
 -			viewModel.touchpadOnlyEnabled.asFlow()
 -		) { controlsState, touchpadState, controlsEnabled, touchpadEnabled ->
+-			when {
+-				controlsEnabled -> controlsState
+-				touchpadEnabled -> touchpadState
+-				else -> ControllerState()
+-			}
 +			viewModel.touchpadOnlyEnabled.asFlow(),
 +			gamepadConnected
 +		) { controlsState, touchpadState, controlsEnabled, touchpadEnabled, connected ->
 +			val mode = TouchControlsMode.select(controlsEnabled, touchpadEnabled,
 +				connected, viewModel.preferences.hideTouchWithGamepad)
 +			val fullVisible = mode == TouchControlsMode.FULL
++			val touchpadVisible = mode == TouchControlsMode.TOUCHPAD
 +			if(controls.requireView().isVisible && !fullVisible) controls.resetInput()
-+			if(touchpad.requireView().isVisible && !touchpadEnabled) touchpad.resetInput()
++			if(touchpad.requireView().isVisible && !touchpadVisible) touchpad.resetInput()
 +			controls.requireView().isVisible = fullVisible
-+			touchpad.requireView().isVisible = touchpadEnabled
- 			when {
--				controlsEnabled -> controlsState
-+				fullVisible -> controlsState
- 				touchpadEnabled -> touchpadState
- 				else -> ControllerState()
- 			}
-@@ -169,12 +190,19 @@ class StreamActivity : AppCompatActivity()
++			touchpad.requireView().isVisible = touchpadVisible
++			if(fullVisible) controlsState else touchpadState
+ 		}.onEach { viewModel.input.touchControllerState = it }
+ 			.launchIn(lifecycleScope)
+ 	}
+@@ -169,12 +187,19 @@ class StreamActivity : AppCompatActivity()
  	override fun onResume()
  	{
  		super.onResume()
@@ -631,7 +635,7 @@ index 735ff88..fb020fe 100644
  		super.onPause()
  		viewModel.session.pause()
  	}
-@@ -183,6 +211,7 @@ class StreamActivity : AppCompatActivity()
+@@ -183,6 +208,7 @@ class StreamActivity : AppCompatActivity()
  	{
  		super.onDestroy()
  		controlsJob?.cancel()
@@ -639,7 +643,7 @@ index 735ff88..fb020fe 100644
  	}
  
  	private fun reconnect()
-@@ -225,7 +254,7 @@ class StreamActivity : AppCompatActivity()
+@@ -225,7 +251,7 @@ class StreamActivity : AppCompatActivity()
  	override fun onWindowFocusChanged(hasFocus: Boolean)
  	{
  		super.onWindowFocusChanged(hasFocus)
@@ -648,7 +652,7 @@ index 735ff88..fb020fe 100644
  			hideSystemUI()
  	}
  
-@@ -357,8 +386,8 @@ class StreamActivity : AppCompatActivity()
+@@ -357,8 +383,8 @@ class StreamActivity : AppCompatActivity()
  
  	private fun adjustStreamViewAspect() = adjustSurfaceViewAspect()
  
@@ -680,20 +684,20 @@ index d374dc1..6fb06c5 100644
  	}
 diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/TouchControlsMode.kt b/android/app/src/main/java/com/metallic/chiaki/stream/TouchControlsMode.kt
 new file mode 100644
-index 0000000..53e6317
+index 0000000..4280dee
 --- /dev/null
 +++ b/android/app/src/main/java/com/metallic/chiaki/stream/TouchControlsMode.kt
 @@ -0,0 +1,13 @@
 +package com.metallic.chiaki.stream
 +
-+/** Full buttons and touchpad-only are mutually exclusive. Keep user choice on disconnect. */
++/** Hiding buttons always leaves the invisible touchpad available in the same screen zone. */
 +enum class TouchControlsMode {
-+    HIDDEN, FULL, TOUCHPAD;
++    FULL, TOUCHPAD;
 +    companion object {
 +        fun select(full: Boolean, touchpad: Boolean, connected: Boolean, autoHide: Boolean) = when {
 +            touchpad -> TOUCHPAD
 +            full && !(connected && autoHide) -> FULL
-+            else -> HIDDEN
++            else -> TOUCHPAD
 +        }
 +    }
 +}
@@ -819,10 +823,18 @@ index a87b90f..5afd23f 100644
  		ownControllerState = ownControllerState.copy().apply {
  			buttons =
 diff --git a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt
-index 004ceae..136c7ea 100644
+index 004ceae..0dcac4a 100644
 --- a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt
 +++ b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchpadView.kt
-@@ -59,7 +59,7 @@ class TouchpadView @JvmOverloads constructor(
+@@ -2,6 +2,7 @@
+ 
+ package com.metallic.chiaki.touchcontrols
+ 
++import android.animation.ValueAnimator
+ import android.content.Context
+ import android.graphics.Canvas
+ import android.graphics.drawable.Drawable
+@@ -59,7 +60,7 @@ class TouchpadView @JvmOverloads constructor(
  	}
  	private val pointerTouches = mutableMapOf<Int, Touch>()
  
@@ -831,7 +843,47 @@ index 004ceae..136c7ea 100644
  	val controllerState: StateFlow<ControllerState> get() = _controllerState.asStateFlow()
  
  	private var shortPressingTouches = listOf<Touch>()
-@@ -106,6 +106,7 @@ class TouchpadView @JvmOverloads constructor(
+@@ -69,10 +70,27 @@ class TouchpadView @JvmOverloads constructor(
+ 			state.stopTouch(it.stateId)
+ 		}
+ 		shortPressingTouches = listOf()
++		hideFeedbackIfIdle()
+ 		triggerStateChanged()
+ 	}
+ 
+ 	private var buttonHeld = false
++	private var feedbackAlpha = 0f
++	private var feedbackAnimator: ValueAnimator? = null
++
++	private fun animateFeedback(visible: Boolean) {
++		feedbackAnimator?.cancel()
++		feedbackAnimator = ValueAnimator.ofFloat(feedbackAlpha, if(visible) 1f else 0f).apply {
++			duration = if(visible) 80L else 160L
++			addUpdateListener { feedbackAlpha = it.animatedValue as Float; invalidate() }
++			start()
++		}
++	}
++
++	private fun hideFeedbackIfIdle() {
++		if(pointerTouches.isEmpty() && state.buttons and ControllerState.BUTTON_TOUCHPAD == 0U)
++			animateFeedback(false)
++	}
+ 
+ 	init
+ 	{
+@@ -87,9 +105,10 @@ class TouchpadView @JvmOverloads constructor(
+ 	override fun onDraw(canvas: Canvas)
+ 	{
+ 		super.onDraw(canvas)
+-		if(pointerTouches.values.find { !it.lifted } == null)
++		if(feedbackAlpha <= 0f)
+ 			return
+ 		val drawable = if(state.buttons and ControllerState.BUTTON_TOUCHPAD != 0U) drawablePressed else drawableIdle
++		drawable?.alpha = (feedbackAlpha * 255).toInt()
+ 		drawable?.setBounds(paddingLeft, paddingTop, width - paddingRight, height - paddingBottom)
+ 		drawable?.draw(canvas)
+ 	}
+@@ -106,11 +125,13 @@ class TouchpadView @JvmOverloads constructor(
  	{
  		when(event.actionMasked)
  		{
@@ -839,7 +891,21 @@ index 004ceae..136c7ea 100644
  			MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
  				state.startTouch(touchX(event, event.actionIndex), touchY(event, event.actionIndex))?.let {
  					haptics.trigger()
-@@ -140,8 +141,8 @@ class TouchpadView @JvmOverloads constructor(
+ 					val touch = Touch(it, event.getX(event.actionIndex), event.getY(event.actionIndex))
+ 					pointerTouches[event.getPointerId(event.actionIndex)] = touch
++					animateFeedback(true)
+ 					if(!buttonHeld)
+ 						postDelayed(touch.startButtonHoldRunnable, BUTTON_HOLD_DELAY_MS)
+ 					triggerStateChanged()
+@@ -130,6 +151,7 @@ class TouchpadView @JvmOverloads constructor(
+ 						it.moveInsignificant -> triggerShortButtonPress(it)
+ 						else -> state.stopTouch(it.stateId)
+ 					}
++					hideFeedbackIfIdle()
+ 					triggerStateChanged()
+ 				}
+ 			}
+@@ -140,8 +162,8 @@ class TouchpadView @JvmOverloads constructor(
  						acc
  					else
  					{
@@ -850,13 +916,16 @@ index 004ceae..136c7ea 100644
  					}
  				}
  				if(changed)
-@@ -159,9 +160,27 @@ class TouchpadView @JvmOverloads constructor(
+@@ -159,9 +181,30 @@ class TouchpadView @JvmOverloads constructor(
  		postDelayed(shortButtonPressLiftRunnable, SHORT_BUTTON_PRESS_DURATION_MS)
  	}
  
 +	private fun snapshot() = state.copy(touches = state.touches.map { it.copy() }.toTypedArray())
 +
 +	fun resetInput() {
++		feedbackAnimator?.cancel()
++		feedbackAnimator = null
++		feedbackAlpha = 0f
 +		pointerTouches.values.forEach { removeCallbacks(it.startButtonHoldRunnable) }
 +		pointerTouches.clear()
 +		removeCallbacks(shortButtonPressLiftRunnable)
@@ -879,9 +948,38 @@ index 004ceae..136c7ea 100644
 +		_controllerState.value = snapshot()
  	}
  }
+diff --git a/android/app/src/main/res/layout/fragment_touchpad_only.xml b/android/app/src/main/res/layout/fragment_touchpad_only.xml
+index 505612a..d852382 100644
+--- a/android/app/src/main/res/layout/fragment_touchpad_only.xml
++++ b/android/app/src/main/res/layout/fragment_touchpad_only.xml
+@@ -7,12 +7,6 @@
+     android:layout_height="match_parent"
+     android:clipChildren="false">
+ 
+-    <com.metallic.chiaki.touchcontrols.ControlsBackgroundView
+-        android:layout_width="match_parent"
+-        android:layout_height="match_parent"
+-        tools:layout_editor_absoluteX="0dp"
+-        tools:layout_editor_absoluteY="90dp" />
+-
+     <com.metallic.chiaki.touchcontrols.TouchpadView
+         android:id="@+id/touchpadView"
+         android:layout_width="0dp"
+@@ -23,8 +17,7 @@
+         app:layout_constraintLeft_toLeftOf="parent"
+         app:layout_constraintRight_toRightOf="parent"
+         app:layout_constraintTop_toTopOf="parent"
+-        app:layout_constraintBottom_toBottomOf="parent"
+-        android:layout_marginLeft="80dp"
+-        android:layout_marginRight="80dp"/>
++        app:layout_constraintWidth_max="300dp"
++        android:layout_marginTop="32dp"/>
+ 
+ </androidx.constraintlayout.widget.ConstraintLayout>
+\ No newline at end of file
 diff --git a/android/app/src/main/res/values-es/gamepad_controls.xml b/android/app/src/main/res/values-es/gamepad_controls.xml
 new file mode 100644
-index 0000000..1b12f96
+index 0000000..07c5ff9
 --- /dev/null
 +++ b/android/app/src/main/res/values-es/gamepad_controls.xml
 @@ -0,0 +1,18 @@
@@ -889,7 +987,7 @@ index 0000000..1b12f96
 +<resources>
 +    <string name="gamepad_controls_title">Gamepad</string>
 +    <string name="gamepad_hide_touch_title">Ocultar botones táctiles con gamepad</string>
-+    <string name="gamepad_hide_touch_summary">Oculta los controles completos al conectar un mando y los restaura al desconectarlo. El modo solo touchpad sigue disponible.</string>
++    <string name="gamepad_hide_touch_summary">Oculta los controles completos al conectar un mando y los restaura al desconectarlo. El touchpad invisible siempre permanece activo.</string>
 +    <string name="gamepad_mapping_title">Asignar botones del gamepad</string>
 +    <string name="gamepad_mapping_summary">Elige un botón de PS5 y pulsa el botón del gamepad. Se guarda un perfil por mando.</string>
 +    <string name="gamepad_mapping_help">Elige el mando conectado y después un botón de PS5. Las asignaciones se aplican en la siguiente sesión. Android puede interceptar botones reservados del sistema. La asignación del touchpad envía un clic; usa la pantalla para deslizar.</string>
@@ -905,7 +1003,7 @@ index 0000000..1b12f96
 +</resources>
 diff --git a/android/app/src/main/res/values/gamepad_controls.xml b/android/app/src/main/res/values/gamepad_controls.xml
 new file mode 100644
-index 0000000..28a2b32
+index 0000000..a66180a
 --- /dev/null
 +++ b/android/app/src/main/res/values/gamepad_controls.xml
 @@ -0,0 +1,18 @@
@@ -913,7 +1011,7 @@ index 0000000..28a2b32
 +<resources>
 +    <string name="gamepad_controls_title">Gamepad</string>
 +    <string name="gamepad_hide_touch_title">Hide touch buttons with a gamepad</string>
-+    <string name="gamepad_hide_touch_summary">Hides the full controller while a gamepad is connected and restores it on disconnect. Touchpad-only mode remains available.</string>
++    <string name="gamepad_hide_touch_summary">Hides the full controller while a gamepad is connected and restores it on disconnect. The invisible touchpad always remains active.</string>
 +    <string name="gamepad_mapping_title">Gamepad button mapping</string>
 +    <string name="gamepad_mapping_summary">Choose a PS5 button, then press its gamepad button. Profiles are saved per controller.</string>
 +    <string name="gamepad_mapping_help">Choose the connected controller, then a PS5 button. Assignments apply on the next session. System-reserved buttons may be intercepted by Android. Touchpad mapping sends a click; use the screen for swipes.</string>
@@ -1033,7 +1131,7 @@ index 0000000..98d33ee
 +}
 diff --git a/android/app/src/test/java/com/metallic/chiaki/stream/TouchControlsModeTest.kt b/android/app/src/test/java/com/metallic/chiaki/stream/TouchControlsModeTest.kt
 new file mode 100644
-index 0000000..a78adaa
+index 0000000..8e2204a
 --- /dev/null
 +++ b/android/app/src/test/java/com/metallic/chiaki/stream/TouchControlsModeTest.kt
 @@ -0,0 +1,21 @@
@@ -1045,11 +1143,11 @@ index 0000000..a78adaa
 +class TouchControlsModeTest {
 +    @Test fun autoHideRestoresButtonsOnDisconnect() {
 +        assertEquals(TouchControlsMode.FULL, TouchControlsMode.select(true, false, false, true))
-+        assertEquals(TouchControlsMode.HIDDEN, TouchControlsMode.select(true, false, true, true))
++        assertEquals(TouchControlsMode.TOUCHPAD, TouchControlsMode.select(true, false, true, true))
 +        assertEquals(TouchControlsMode.FULL, TouchControlsMode.select(true, false, false, true))
 +    }
-+    @Test fun disabledButtonsStayDisabledAfterDisconnect() {
-+        assertEquals(TouchControlsMode.HIDDEN, TouchControlsMode.select(false, false, false, true))
++    @Test fun touchpadStaysAvailableWithButtonsDisabled() {
++        assertEquals(TouchControlsMode.TOUCHPAD, TouchControlsMode.select(false, false, false, true))
 +    }
 +    @Test fun autoHideIsOptional() {
 +        assertEquals(TouchControlsMode.FULL, TouchControlsMode.select(true, false, true, false))
@@ -1060,13 +1158,22 @@ index 0000000..a78adaa
 +}
 diff --git a/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchInputTest.kt b/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchInputTest.kt
 new file mode 100644
-index 0000000..adcc3c4
+index 0000000..4c840f5
 --- /dev/null
 +++ b/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchInputTest.kt
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,99 @@
 +package com.metallic.chiaki.touchcontrols
 +
 +import android.view.MotionEvent
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Color
++import android.os.Looper
++import com.metallic.chiaki.R
++import com.metallic.chiaki.lib.ControllerState
++import org.robolectric.Robolectric
++import org.robolectric.Shadows.shadowOf
++import java.time.Duration
 +import org.robolectric.RuntimeEnvironment
 +import android.content.Context
 +import org.junit.Assert.*
@@ -1074,11 +1181,39 @@ index 0000000..adcc3c4
 +import org.junit.runner.RunWith
 +import org.robolectric.RobolectricTestRunner
 +import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
 +
 +@RunWith(RobolectricTestRunner::class)
 +@Config(sdk = [28])
 +class TouchInputTest {
 +    private fun event(action: Int, x: Float = 10f) = MotionEvent.obtain(0, 0, action, x, 10f, 0)
++    @GraphicsMode(GraphicsMode.Mode.NATIVE)
++    @Test fun touchpadIsInvisibleAtRestAndShowsTapFeedbackUntilReleaseAnimationEnds() {
++        val attrs = Robolectric.buildAttributeSet()
++            .addAttribute(R.attr.drawableIdle, "@drawable/control_touchpad")
++            .addAttribute(R.attr.drawablePressed, "@drawable/control_touchpad_pressed").build()
++        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
++        val touchpad = TouchpadView(activity, attrs)
++        activity.setContentView(touchpad, android.view.ViewGroup.LayoutParams(100, 100))
++        touchpad.layout(0, 0, 100, 100)
++        fun centerAlpha(): Int {
++            val bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
++            touchpad.draw(Canvas(bitmap))
++            return Color.alpha(bitmap.getPixel(50, 50))
++        }
++        assertEquals(0, centerAlpha())
++        event(MotionEvent.ACTION_DOWN).also { touchpad.onTouchEvent(it); it.recycle() }
++        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(100))
++        assertTrue(centerAlpha() > 0)
++        event(MotionEvent.ACTION_UP).also { touchpad.onTouchEvent(it); it.recycle() }
++        assertEquals(ControllerState.BUTTON_TOUCHPAD, touchpad.controllerState.value.buttons)
++        // A quick tap must display its pressed drawable after the finger leaves.
++        assertTrue(centerAlpha() > 0)
++        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(450))
++        assertEquals(0U, touchpad.controllerState.value.buttons)
++        assertEquals(0, centerAlpha())
++    }
++
 +    @Test fun profilePersistsPerController() {
 +        val context = RuntimeEnvironment.getApplication()
 +        val prefs = com.metallic.chiaki.common.Preferences(context)
