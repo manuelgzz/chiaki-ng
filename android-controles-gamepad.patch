@@ -523,7 +523,7 @@ index d568a51..f4c4a45 100644
  		viewModel.registeredHostsCount.observe(this, Observer {
  			registeredHostsPreference?.summary = getString(R.string.preferences_registered_hosts_summary, it)
 diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
-index 735ff88..93e05c1 100644
+index 735ff88..4344f0f 100644
 --- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
 +++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
 @@ -6,6 +6,7 @@ import android.animation.Animator
@@ -606,12 +606,12 @@ index 735ff88..93e05c1 100644
 +			val mode = TouchControlsMode.select(controlsEnabled, touchpadEnabled,
 +				connected, viewModel.preferences.hideTouchWithGamepad)
 +			val fullVisible = mode == TouchControlsMode.FULL
-+			val touchpadVisible = mode == TouchControlsMode.TOUCHPAD
 +			if(controls.requireView().isVisible && !fullVisible) controls.resetInput()
-+			if(touchpad.requireView().isVisible && !touchpadVisible) touchpad.resetInput()
 +			controls.requireView().isVisible = fullVisible
-+			touchpad.requireView().isVisible = touchpadVisible
-+			if(fullVisible) controlsState else touchpadState
++			// One independent panel stays attached and keeps its input subscription.
++			// Hiding buttons must never hide, reset, or replace the touchpad.
++			touchpad.requireView().isVisible = true
++			(if(fullVisible) controlsState else ControllerState()) or touchpadState
  		}.onEach { viewModel.input.touchControllerState = it }
  			.launchIn(lifecycleScope)
  	}
@@ -732,7 +732,7 @@ index 66a9afe..40521de 100644
  		}
  		return true
 diff --git a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt
-index 8aff784..2715871 100644
+index 8aff784..177cb79 100644
 --- a/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt
 +++ b/android/app/src/main/java/com/metallic/chiaki/touchcontrols/TouchControlsFragment.kt
 @@ -4,6 +4,8 @@ package com.metallic.chiaki.touchcontrols
@@ -762,15 +762,20 @@ index 8aff784..2715871 100644
  	var onScreenControlsEnabled: LiveData<Boolean>? = null
  }
  
-@@ -91,6 +104,18 @@ class DefaultTouchControlsFragment : TouchControlsFragment()
+@@ -48,8 +61,7 @@ class DefaultTouchControlsFragment : TouchControlsFragment()
+ 	override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
+ 		FragmentControlsBinding.inflate(inflater, container, false).let {
+ 			_binding = it
+-			_controllerStateSource.value =
+-				combine(_ownControllerStateFlow, binding.touchpadView.controllerState) { a, b -> a or b }
++			_controllerStateSource.value = _ownControllerStateFlow
+ 			it.root
+ 		}
+ 
+@@ -91,6 +103,13 @@ class DefaultTouchControlsFragment : TouchControlsFragment()
  		})
  	}
  
-+	override fun resetInput() {
-+		super.resetInput()
-+		_binding?.touchpadView?.resetInput()
-+	}
-+
 +	override fun onDestroyView() {
 +		resetInput()
 +		_controllerStateSource.value = _ownControllerStateFlow
@@ -948,35 +953,75 @@ index 004ceae..0dcac4a 100644
 +		_controllerState.value = snapshot()
  	}
  }
+diff --git a/android/app/src/main/res/layout/fragment_controls.xml b/android/app/src/main/res/layout/fragment_controls.xml
+index 7a6b3af..cdf241b 100644
+--- a/android/app/src/main/res/layout/fragment_controls.xml
++++ b/android/app/src/main/res/layout/fragment_controls.xml
+@@ -47,19 +47,6 @@
+         app:drawableHandle="@drawable/control_analog_stick_handle"
+         />
+ 
+-    <com.metallic.chiaki.touchcontrols.TouchpadView
+-        android:id="@+id/touchpadView"
+-        android:layout_width="0dp"
+-        android:layout_height="0dp"
+-        app:drawableIdle="@drawable/control_touchpad"
+-        app:drawablePressed="@drawable/control_touchpad_pressed"
+-        android:layout_marginTop="32dp"
+-        app:layout_constraintTop_toTopOf="parent"
+-        app:layout_constraintWidth_max="300dp"
+-        app:layout_constraintDimensionRatio="1920:942"
+-        app:layout_constraintRight_toRightOf="parent"
+-        app:layout_constraintLeft_toLeftOf="parent"/>
+-
+     <com.metallic.chiaki.touchcontrols.DPadView
+         android:id="@+id/dpadView"
+         android:layout_width="160dp"
 diff --git a/android/app/src/main/res/layout/fragment_touchpad_only.xml b/android/app/src/main/res/layout/fragment_touchpad_only.xml
-index 505612a..d852382 100644
+index 505612a..6dfb353 100644
 --- a/android/app/src/main/res/layout/fragment_touchpad_only.xml
 +++ b/android/app/src/main/res/layout/fragment_touchpad_only.xml
-@@ -7,12 +7,6 @@
+@@ -1,30 +1,17 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<androidx.constraintlayout.widget.ConstraintLayout
+-    xmlns:android="http://schemas.android.com/apk/res/android"
++<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+-    xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
      android:layout_height="match_parent"
-     android:clipChildren="false">
- 
+-    android:clipChildren="false">
+-
 -    <com.metallic.chiaki.touchcontrols.ControlsBackgroundView
 -        android:layout_width="match_parent"
 -        android:layout_height="match_parent"
 -        tools:layout_editor_absoluteX="0dp"
 -        tools:layout_editor_absoluteY="90dp" />
--
++    android:clickable="false"
++    android:focusable="false">
+ 
      <com.metallic.chiaki.touchcontrols.TouchpadView
          android:id="@+id/touchpadView"
-         android:layout_width="0dp"
-@@ -23,8 +17,7 @@
-         app:layout_constraintLeft_toLeftOf="parent"
-         app:layout_constraintRight_toRightOf="parent"
-         app:layout_constraintTop_toTopOf="parent"
+-        android:layout_width="0dp"
+-        android:layout_height="0dp"
++        android:layout_width="300dp"
++        android:layout_height="147dp"
++        android:layout_gravity="top|center_horizontal"
++        android:layout_marginTop="32dp"
+         app:drawableIdle="@drawable/control_touchpad"
+-        app:drawablePressed="@drawable/control_touchpad_pressed"
+-        app:layout_constraintDimensionRatio="1920:942"
+-        app:layout_constraintLeft_toLeftOf="parent"
+-        app:layout_constraintRight_toRightOf="parent"
+-        app:layout_constraintTop_toTopOf="parent"
 -        app:layout_constraintBottom_toBottomOf="parent"
 -        android:layout_marginLeft="80dp"
 -        android:layout_marginRight="80dp"/>
-+        app:layout_constraintWidth_max="300dp"
-+        android:layout_marginTop="32dp"/>
- 
- </androidx.constraintlayout.widget.ConstraintLayout>
+-
+-</androidx.constraintlayout.widget.ConstraintLayout>
 \ No newline at end of file
++        app:drawablePressed="@drawable/control_touchpad_pressed" />
++</FrameLayout>
 diff --git a/android/app/src/main/res/values-es/gamepad_controls.xml b/android/app/src/main/res/values-es/gamepad_controls.xml
 new file mode 100644
 index 0000000..07c5ff9
@@ -1259,5 +1304,83 @@ index 0000000..4c840f5
 +        touchpad.resetInput()
 +        assertTrue(touchpad.controllerState.value.touches.all { it.id < 0 })
 +        assertEquals(0U, touchpad.controllerState.value.buttons)
++    }
++}
+diff --git a/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchpadLayoutTest.kt b/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchpadLayoutTest.kt
+new file mode 100644
+index 0000000..976d548
+--- /dev/null
++++ b/android/app/src/test/java/com/metallic/chiaki/touchcontrols/TouchpadLayoutTest.kt
+@@ -0,0 +1,72 @@
++package com.metallic.chiaki.touchcontrols
++
++import android.os.Looper
++import android.view.MotionEvent
++import android.view.View
++import androidx.fragment.app.FragmentActivity
++import com.metallic.chiaki.R
++import com.metallic.chiaki.common.Preferences
++import com.metallic.chiaki.lib.ControllerState
++import com.metallic.chiaki.session.StreamInput
++import kotlinx.coroutines.*
++import kotlinx.coroutines.flow.launchIn
++import kotlinx.coroutines.flow.onEach
++import org.junit.Assert.*
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.Robolectric
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [28])
++class TouchpadLayoutTest {
++    @Test fun hiddenButtonsLeaveARealTouchablePanelAndSendPs5Click() {
++        val controller = Robolectric.buildActivity(FragmentActivity::class.java)
++        val activity = controller.get()
++        activity.setTheme(R.style.AppTheme)
++        controller.setup()
++        activity.setContentView(R.layout.activity_stream)
++        val controls = activity.supportFragmentManager.findFragmentById(R.id.controlsFragment)!!
++        val panel = activity.supportFragmentManager.findFragmentById(R.id.touchpadOnlyFragment) as TouchpadOnlyFragment
++        controls.requireView().visibility = View.GONE
++        panel.requireView().visibility = View.VISIBLE
++        val root = activity.findViewById<View>(R.id.mainStreamLayout)
++        root.findViewById<View>(R.id.overlay).visibility = View.GONE
++        root.measure(View.MeasureSpec.makeMeasureSpec(1280, View.MeasureSpec.EXACTLY),
++            View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY))
++        root.layout(0, 0, 1280, 720)
++        val pad = panel.requireView().findViewById<TouchpadView>(R.id.touchpadView)
++        assertTrue("Touchpad width must be positive: ${pad.width}", pad.width > 0)
++        assertTrue("Touchpad height must be positive: ${pad.height}", pad.height > 0)
++        val input = StreamInput(activity, Preferences(activity))
++        var sent = ControllerState()
++        input.controllerStateChangedCallback = { sent = it }
++        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
++        panel.controllerState.onEach { input.touchControllerState = it }.launchIn(scope)
++        val pos = IntArray(2); pad.getLocationOnScreen(pos)
++        val rootPos = IntArray(2); root.getLocationOnScreen(rootPos)
++        val x = (pos[0] - rootPos[0] + pad.width / 2).toFloat()
++        val y = (pos[1] - rootPos[1] + pad.height / 2).toFloat()
++        for(visible in listOf(true, false, true, false)) {
++            controls.requireView().visibility = if(visible) View.VISIBLE else View.GONE
++            root.measure(View.MeasureSpec.makeMeasureSpec(1280, View.MeasureSpec.EXACTLY),
++                View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY))
++            root.layout(0, 0, 1280, 720)
++            val now = android.os.SystemClock.uptimeMillis()
++            MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0).also {
++                assertTrue("Screen touch must reach panel, buttons visible=$visible", root.dispatchTouchEvent(it)); it.recycle()
++            }
++            assertTrue("PS5 must receive touch coordinates, buttons visible=$visible", sent.touches.any { it.id >= 0 })
++            MotionEvent.obtain(now, now + 30, MotionEvent.ACTION_UP, x, y, 0).also {
++                root.dispatchTouchEvent(it); it.recycle()
++            }
++            assertEquals("PS5 must receive touchpad click, buttons visible=$visible", ControllerState.BUTTON_TOUCHPAD,
++                sent.buttons and ControllerState.BUTTON_TOUCHPAD)
++            panel.resetInput()
++        }
++        scope.cancel()
++        controller.pause().stop().destroy()
 +    }
 +}

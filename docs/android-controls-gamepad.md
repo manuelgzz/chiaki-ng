@@ -27,3 +27,5 @@ El workflow ejecuta las pruebas JVM de asignación, visibilidad, persistencia y 
 las pruebas nativas de ciclo de vida/pacing, y genera un APK ARM64.
 La interacción real multitáctil, conexión/desconexión Bluetooth/USB y la estabilidad en PS5
 requieren validar el nuevo APK en la Y700.
+
+El touchpad usa una capa independiente de tamaño explícito (300 × 147 dp, centrada arriba a 32 dp). Ocultar los botones solo oculta su capa; no cambia ni reinicia el touchpad. La prueba de integración infla la pantalla completa y envía toques hasta StreamInput con los botones visibles y ocultos.
